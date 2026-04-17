@@ -277,11 +277,10 @@ DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
 - Use `#` for the deck title, `##` for each slide title, `###` for sub-sections.
-- Under each slide title, write 3-7 short bullet points starting with `- `.
-- Each bullet must be a concise phrase (ideally under ~15 words). No long sentences.
+- Under each slide title, write 3-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
+- Do not leave any content out, but do summarize ideas instead of repeating verbatim.
 - Drop filler, repetition, and boilerplate.
-- Keep tables as GitHub-flavored markdown tables.
 """
 
 
@@ -1254,6 +1253,8 @@ def generate_pptx(
                     model=ollama_model,
                     system_prompt=system_prompt,
                 )
+                print("raw_text:\n", raw_text)
+                print("rewritten:\n", rewritten)
                 if rewritten:
                     raw_text = rewritten
                     print("   LLM rewrite applied.")
