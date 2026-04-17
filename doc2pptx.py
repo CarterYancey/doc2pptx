@@ -266,6 +266,54 @@ def read_document(path: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 2b. LLM REWRITE (Ollama) — prose → PPT-friendly markdown
+# ─────────────────────────────────────────────────────────────
+
+DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+
+DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly into a PowerPoint deck.
+
+Rules:
+- Output ONLY markdown. No preamble, no commentary, no code fences.
+- Use `#` for the deck title, `##` for each slide title, `###` for sub-sections.
+- Under each slide title, write 3-7 bullet points starting with `- `.
+- Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
+- Do not leave any content out, but do summarize ideas instead of repeating verbatim.
+- Drop filler, repetition, and boilerplate.
+"""
+
+
+def rewrite_for_pptx(
+    raw_text: str,
+    host: str = DEFAULT_OLLAMA_HOST,
+    model: str = DEFAULT_OLLAMA_MODEL,
+    system_prompt: str | None = None,
+    timeout: float = 120.0,
+) -> str:
+    """Ask a local Ollama server to reshape raw_text into PPT-friendly markdown.
+
+    Returns the rewritten markdown. Raises on HTTP/connection errors — callers
+    decide whether to fall back to the original text.
+    """
+    import httpx
+
+    payload = {
+        "model": model,
+        "prompt": raw_text,
+        "system": system_prompt or DEFAULT_REWRITE_PROMPT,
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+    url = host.rstrip("/") + "/api/generate"
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return (data.get("response") or "").strip()
+
+
+# ─────────────────────────────────────────────────────────────
 # 3. TEXT → STRUCTURED SLIDES PARSER
 # ─────────────────────────────────────────────────────────────
 
@@ -1157,6 +1205,10 @@ def generate_pptx(
     title: str | None = None,
     max_bullets: int = 7,
     max_table_rows: int = MAX_TABLE_ROWS_PER_SLIDE,
+    use_llm: bool = True,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+    ollama_model: str = DEFAULT_OLLAMA_MODEL,
+    llm_prompt_file: str | None = None,
 ):
     """
     Main entry point: read a document file and produce a .pptx presentation.
@@ -1168,6 +1220,13 @@ def generate_pptx(
         title:         Optional override for the presentation title
         max_bullets:   Maximum bullet points per slide before auto-splitting
         max_table_rows: Maximum data rows per table slide (xlsx/csv only)
+        use_llm:       If True, rewrite extracted text with a local Ollama server
+                       before parsing. Skipped automatically for spreadsheets and
+                       when the server is unreachable.
+        ollama_host:   Base URL of the Ollama server.
+        ollama_model:  Model name to request from Ollama.
+        llm_prompt_file: Optional path to a text file containing a custom system
+                       prompt to override the default rewrite instructions.
     """
     ext = Path(input_path).suffix.lower()
     is_spreadsheet = ext in (".xlsx", ".xls", ".xlsm", ".csv", ".tsv")
@@ -1181,6 +1240,29 @@ def generate_pptx(
         raw_text = read_document(input_path)
         if not raw_text.strip():
             raise ValueError(f"No text content could be extracted from '{input_path}'.")
+
+        if use_llm:
+            print(f"🧠 Rewriting with Ollama ({ollama_model}) at {ollama_host}...")
+            try:
+                system_prompt = None
+                if llm_prompt_file:
+                    system_prompt = Path(llm_prompt_file).read_text(encoding="utf-8")
+                rewritten = rewrite_for_pptx(
+                    raw_text,
+                    host=ollama_host,
+                    model=ollama_model,
+                    system_prompt=system_prompt,
+                )
+                print("raw_text:\n", raw_text)
+                print("rewritten:\n", rewritten)
+                if rewritten:
+                    raw_text = rewritten
+                    print("   LLM rewrite applied.")
+                else:
+                    print("   ⚠️  LLM returned empty output; using original text.")
+            except Exception as exc:
+                print(f"   ⚠️  LLM rewrite skipped ({exc}); using original text.")
+
         print("🔍 Parsing document structure...")
         deck = parse_text_to_deck(raw_text, deck_title=title or "", max_bullets=max_bullets)
 
@@ -1263,6 +1345,8 @@ Examples:
   python doc2pptx.py page.html -o slides.pptx --max-bullets 5
   python doc2pptx.py data.xlsx -o tables.pptx
   python doc2pptx.py data.csv -o tables.pptx --max-table-rows 10
+  python doc2pptx.py report.pdf -o deck.pptx --no-llm
+  python doc2pptx.py report.pdf -o deck.pptx --ollama-model qwen2.5
         """,
     )
     parser.add_argument("input", help="Input document path (.txt, .md, .docx, .pdf, .html, .xlsx, .csv, .tsv)")
@@ -1272,6 +1356,14 @@ Examples:
     parser.add_argument("--max-bullets", type=int, default=7, help="Max bullet points per slide before splitting (default: 7)")
     parser.add_argument("--max-table-rows", type=int, default=MAX_TABLE_ROWS_PER_SLIDE,
                         help=f"Max data rows per table slide (default: {MAX_TABLE_ROWS_PER_SLIDE})")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Skip the Ollama rewrite step (LLM rewrite is on by default).")
+    parser.add_argument("--ollama-host", default=DEFAULT_OLLAMA_HOST,
+                        help=f"Ollama server base URL (default: {DEFAULT_OLLAMA_HOST}, env: OLLAMA_HOST)")
+    parser.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL,
+                        help=f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL}, env: OLLAMA_MODEL)")
+    parser.add_argument("--prompt-file", default=None,
+                        help="Path to a text file containing a custom system prompt for the rewrite step.")
 
     args = parser.parse_args()
 
@@ -1283,6 +1375,10 @@ Examples:
         print(f"Error: Template file not found: {args.template}", file=sys.stderr)
         sys.exit(1)
 
+    if args.prompt_file and not os.path.exists(args.prompt_file):
+        print(f"Error: Prompt file not found: {args.prompt_file}", file=sys.stderr)
+        sys.exit(1)
+
     generate_pptx(
         input_path=args.input,
         output_path=args.output,
@@ -1290,6 +1386,10 @@ Examples:
         title=args.title,
         max_bullets=args.max_bullets,
         max_table_rows=args.max_table_rows,
+        use_llm=not args.no_llm,
+        ollama_host=args.ollama_host,
+        ollama_model=args.ollama_model,
+        llm_prompt_file=args.prompt_file,
     )
 
 

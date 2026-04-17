@@ -21,7 +21,14 @@ def _copy_with_original_name(src_path: str, dst_dir: str, fallback_name: str) ->
     return dst
 
 
-def generate_pptx(document_file, template_file):
+def generate_pptx(
+    document_file,
+    template_file,
+    use_llm,
+    ollama_host,
+    ollama_model,
+    custom_prompt,
+):
     if document_file is None:
         raise gr.Error("Please upload a document file.")
 
@@ -41,12 +48,23 @@ def generate_pptx(document_file, template_file):
                 template_file,
                 str(workdir),
                 "uploaded_template.pptx"
-            )        
+            )
+
+        prompt_file_path = None
+        if custom_prompt and custom_prompt.strip() and custom_prompt.strip() != doc2pptx.DEFAULT_REWRITE_PROMPT.strip():
+            prompt_path = workdir / "custom_prompt.txt"
+            prompt_path.write_text(custom_prompt, encoding="utf-8")
+            prompt_file_path = str(prompt_path)
+
         doc2pptx.generate_pptx(
             input_path=str(input_doc),
             output_path=str(output_pptx),
             template_path=str(input_template) if input_template else None,
             title=None,
+            use_llm=bool(use_llm),
+            ollama_host=(ollama_host or doc2pptx.DEFAULT_OLLAMA_HOST).strip(),
+            ollama_model=(ollama_model or doc2pptx.DEFAULT_OLLAMA_MODEL).strip(),
+            llm_prompt_file=prompt_file_path,
         )
 
         if not output_pptx.exists():
@@ -73,13 +91,40 @@ with gr.Blocks(title=APP_TITLE) as demo:
             type="filepath",
         )
 
+    with gr.Accordion("LLM rewrite (local Ollama)", open=False):
+        use_llm_input = gr.Checkbox(
+            label="Rewrite extracted text with a local LLM before building slides",
+            value=True,
+        )
+        with gr.Row():
+            ollama_host_input = gr.Textbox(
+                label="Ollama host",
+                value=doc2pptx.DEFAULT_OLLAMA_HOST,
+            )
+            ollama_model_input = gr.Textbox(
+                label="Ollama model",
+                value=doc2pptx.DEFAULT_OLLAMA_MODEL,
+            )
+        custom_prompt_input = gr.Textbox(
+            label="System prompt (edit to override; restore default by matching the text below)",
+            value=doc2pptx.DEFAULT_REWRITE_PROMPT,
+            lines=10,
+        )
+
     run_button = gr.Button("Generate PowerPoint", variant="primary")
 
     output_file = gr.File(label="Generated PowerPoint")
 
     run_button.click(
         fn=generate_pptx,
-        inputs=[document_input, template_input],
+        inputs=[
+            document_input,
+            template_input,
+            use_llm_input,
+            ollama_host_input,
+            ollama_model_input,
+            custom_prompt_input,
+        ],
         outputs=[output_file],
     )
 
