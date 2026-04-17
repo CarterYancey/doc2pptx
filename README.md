@@ -12,22 +12,10 @@ Convert documents (txt, md, docx, pdf, html, xlsx, csv) into PowerPoint presenta
 
 ## Installation
 
-Requires Python ≥3.12. Install dependencies with:
+Requires Python ≥3.12 and [uv](https://docs.astral.sh/uv/). Install dependencies with:
 
 ```bash
 uv sync
-```
-
-Or with pip:
-
-```bash
-pip install beautifulsoup4 markdown pdfplumber pypdf python-docx python-pptx
-```
-
-For spreadsheet support (`.xlsx`, `.csv`, `.tsv`), also install:
-
-```bash
-pip install pandas openpyxl
 ```
 
 ## Usage
@@ -35,31 +23,31 @@ pip install pandas openpyxl
 Basic conversion:
 
 ```bash
-python doc2pptx.py input.md -o output.pptx
+uv run doc2pptx.py input.md -o output.pptx
 ```
 
 With a style template:
 
 ```bash
-python doc2pptx.py report.pdf -o output.pptx --template brand.pptx
+uv run doc2pptx.py report.pdf -o output.pptx --template brand.pptx
 ```
 
 With custom title:
 
 ```bash
-python doc2pptx.py notes.txt -o output.pptx --template brand.pptx --title "My Deck"
+uv run doc2pptx.py notes.txt -o output.pptx --template brand.pptx --title "My Deck"
 ```
 
 Limit bullets per slide:
 
 ```bash
-python doc2pptx.py article.docx -o slides.pptx --max-bullets 5
+uv run doc2pptx.py article.docx -o slides.pptx --max-bullets 5
 ```
 
 Spreadsheet with custom rows per table slide:
 
 ```bash
-python doc2pptx.py data.csv -o tables.pptx --max-table-rows 10
+uv run doc2pptx.py data.csv -o tables.pptx --max-table-rows 10
 ```
 
 ## Supported Formats
