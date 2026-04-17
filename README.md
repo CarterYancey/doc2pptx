@@ -70,6 +70,38 @@ uv run doc2pptx.py data.csv -o tables.pptx --max-table-rows 10
 | `--title` | *(from document)* | Override presentation title |
 | `--max-bullets` | `7` | Bullet points per slide before auto-splitting |
 | `--max-table-rows` | `15` | Data rows per table slide (spreadsheets only) |
+| `--no-llm` | *(off)* | Skip the Ollama rewrite step |
+| `--ollama-host` | `http://localhost:11434` | Ollama server base URL (env: `OLLAMA_HOST`) |
+| `--ollama-model` | `llama3.2` | Ollama model name (env: `OLLAMA_MODEL`) |
+| `--prompt-file` | — | Path to a text file with a custom system prompt |
+
+## LLM rewrite (optional)
+
+When a local [Ollama](https://ollama.com) server is running, doc2pptx will
+reshape the extracted text into PPT-friendly markdown (concise bullets, clear
+slide headings) before building slides. This usually produces tighter decks
+from prose-heavy sources like PDFs and long Word documents.
+
+- The rewrite is **on by default**; pass `--no-llm` to skip it.
+- If the server is unreachable, doc2pptx prints a warning and falls back to
+  the raw extracted text — generation always continues.
+- Spreadsheet inputs (`.xlsx`, `.csv`, …) bypass the LLM step entirely.
+
+Pull a model once, then run as usual:
+
+```bash
+ollama pull llama3.2
+uv run doc2pptx.py report.pdf -o deck.pptx
+```
+
+Override the model, host, or prompt:
+
+```bash
+uv run doc2pptx.py report.pdf -o deck.pptx \
+    --ollama-model qwen2.5 \
+    --ollama-host http://localhost:11434 \
+    --prompt-file my_prompt.txt
+```
 
 ## Templates
 
