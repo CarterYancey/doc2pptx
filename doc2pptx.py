@@ -446,6 +446,16 @@ def _parse_markdown_structured(
         nonlocal current_slide, body_buffer
         if current_slide is not None:
             current_slide.body_lines = body_buffer
+            # Drop the empty H2 companion content slide when no bullets
+            # followed the section divider (avoids duplicate titles).
+            if (
+                current_slide.level == 2
+                and current_slide.slide_type == "content"
+                and not body_buffer
+            ):
+                current_slide = None
+                body_buffer = []
+                return
             chunks = _chunk_body_lines(current_slide.body_lines, max_bullets)
             if len(chunks) == 1:
                 deck.slides.append(current_slide)
@@ -476,6 +486,16 @@ def _parse_markdown_structured(
                     current_slide = SlideContent(title=text, level=1, slide_type="title")
                 else:
                     current_slide = SlideContent(title=text, level=1, slide_type="section")
+            elif level == 2:
+                # H2 is always a section divider. Emit the section slide
+                # immediately, then start a companion content slide with the
+                # same title so any bullets before the next heading spill
+                # onto it. If no bullets arrive, flush_slide drops the empty
+                # companion to avoid a duplicate title slide.
+                deck.slides.append(
+                    SlideContent(title=text, level=2, slide_type="section")
+                )
+                current_slide = SlideContent(title=text, level=2, slide_type="content")
             else:
                 current_slide = SlideContent(title=text, level=level, slide_type="content")
             continue
@@ -630,10 +650,16 @@ class TemplateStyle:
     title_layout_idx: int = 0
     section_layout_idx: int = 0
     content_layout_idx: int = 1
+    # Whether a real Section Header layout was found (vs. a fallback).
+    # When False, section slides use the default-style renderer so they
+    # still look distinct from plain content slides.
+    section_layout_found: bool = False
     # Fonts detected from template
     title_font: str = "Calibri"
     body_font: str = "Calibri"
     title_size: Pt = field(default_factory=lambda: Pt(36))
+    section_title_size: Pt | None = None
+    content_title_size: Pt | None = None
     body_size: Pt = field(default_factory=lambda: Pt(16))
     # Colors
     title_color: RGBColor | None = None
@@ -641,15 +667,24 @@ class TemplateStyle:
     background_fill: any = None
 
 
-def _find_best_layout(prs: Presentation, target: str) -> int:
-    """Find the layout index that best matches a target purpose."""
+def _find_best_layout(prs: Presentation, target: str) -> tuple[int, bool]:
+    """Find the layout index that best matches a target purpose.
+
+    Returns ``(index, matched)`` where ``matched`` is True when a layout
+    whose name actually matched a keyword was found (vs. falling back to a
+    generic index). Callers use ``matched`` to decide whether to trust the
+    layout for decorative purposes — e.g. section slides fall back to the
+    default renderer when no real Section Header layout exists.
+    """
     layouts = prs.slide_layouts
     target_lower = target.lower()
 
-    # Keywords to match layout names
+    # Keywords to match layout names. "blank" is deliberately excluded from
+    # "section" — a blank layout has no decoration and is indistinguishable
+    # from a content slide, which defeats the purpose of a section divider.
     keyword_map = {
         "title": ["title slide", "title", "cover"],
-        "section": ["section header", "section", "divider", "blank"],
+        "section": ["section header", "section", "divider"],
         "content": [
             "title and content", "two content", "content",
             "title, content", "title and body", "text",
@@ -660,11 +695,24 @@ def _find_best_layout(prs: Presentation, target: str) -> int:
     for priority_kw in keywords:
         for idx, layout in enumerate(layouts):
             if layout.name and priority_kw in layout.name.lower():
-                return idx
+                return idx, True
 
     # Fallback: title=0, section=0, content=1 (or 0 if only one layout)
     fallback = {"title": 0, "section": 0, "content": min(1, len(layouts) - 1)}
-    return fallback.get(target_lower, 0)
+    return fallback.get(target_lower, 0), False
+
+
+def _layout_title_size(layout) -> Pt | None:
+    """Return the size of the first sized run on the layout's title
+    placeholder (idx=0), or None if the layout doesn't advertise one."""
+    for ph in layout.placeholders:
+        if ph.placeholder_format.idx != 0 or not ph.has_text_frame:
+            continue
+        for para in ph.text_frame.paragraphs:
+            for run in para.runs:
+                if run.font.size:
+                    return run.font.size
+    return None
 
 
 def _extract_font_info(prs: Presentation) -> dict:
@@ -726,14 +774,27 @@ def analyze_template(template_path: str) -> TemplateStyle:
     prs = Presentation(template_path)
     font_info = _extract_font_info(prs)
 
+    title_idx, _ = _find_best_layout(prs, "title")
+    section_idx, section_found = _find_best_layout(prs, "section")
+    content_idx, _ = _find_best_layout(prs, "content")
+
+    layouts = prs.slide_layouts
+    section_title_size = (
+        _layout_title_size(layouts[section_idx]) if section_found else None
+    )
+    content_title_size = _layout_title_size(layouts[content_idx])
+
     style = TemplateStyle(
         presentation=prs,
-        title_layout_idx=_find_best_layout(prs, "title"),
-        section_layout_idx=_find_best_layout(prs, "section"),
-        content_layout_idx=_find_best_layout(prs, "content"),
+        title_layout_idx=title_idx,
+        section_layout_idx=section_idx,
+        content_layout_idx=content_idx,
+        section_layout_found=section_found,
         title_font=font_info["title_font"],
         body_font=font_info["body_font"],
         title_size=font_info["title_size"],
+        section_title_size=section_title_size,
+        content_title_size=content_title_size,
         body_size=font_info["body_size"],
         title_color=font_info["title_color"],
         body_color=font_info["body_color"],
@@ -1125,16 +1186,97 @@ def _add_table_slide_from_template(prs: Presentation, style: TemplateStyle, slid
     )
 
 
+def _set_placeholder_text(ph, text: str, fallback_font: str,
+                          fallback_size: Pt | None, fallback_color: RGBColor | None):
+    """Write ``text`` into a placeholder while preserving the layout's
+    existing run formatting where possible.
+
+    The layout placeholder already carries the template designer's font,
+    size, weight, and color. Calling ``ph.text = ...`` blows all of that
+    away. Instead, reuse the first paragraph's first run (which inherits
+    layout styling via the run/paragraph/default chain) and only fill in
+    ``font.name``/``font.size``/``font.color`` when the layout itself
+    didn't provide one.
+    """
+    tf = ph.text_frame
+    # Keep the first paragraph (inherits layout pPr); drop the rest.
+    while len(tf.paragraphs) > 1:
+        tf.paragraphs[-1]._p.getparent().remove(tf.paragraphs[-1]._p)
+    p = tf.paragraphs[0]
+    # Preserve the first run if present (keeps its rPr); otherwise make one.
+    if p.runs:
+        run = p.runs[0]
+        # Clear any additional runs so we end up with a single run.
+        for extra in list(p.runs[1:]):
+            extra._r.getparent().remove(extra._r)
+    else:
+        run = p.add_run()
+    run.text = text
+    # Only fill in properties the layout didn't already supply.
+    if not run.font.name and fallback_font:
+        run.font.name = fallback_font
+    if run.font.size is None and fallback_size:
+        run.font.size = fallback_size
+    try:
+        has_color = run.font.color and run.font.color.type is not None
+    except (AttributeError, TypeError):
+        has_color = False
+    if not has_color and fallback_color:
+        run.font.color.rgb = fallback_color
+
+
+def _fill_body_placeholder(ph, lines: list[str], style: TemplateStyle):
+    """Write ``lines`` into a body placeholder, reusing the layout's
+    existing bullet/paragraph formatting for the first line so the
+    template's indent and bullet glyph stay intact."""
+    tf = ph.text_frame
+    # Drop every paragraph past the first so we can rebuild from a clean slate.
+    while len(tf.paragraphs) > 1:
+        tf.paragraphs[-1]._p.getparent().remove(tf.paragraphs[-1]._p)
+    first_p = tf.paragraphs[0]
+    # Clear runs from the first paragraph but keep its pPr (bullet/indent).
+    for r in list(first_p.runs):
+        r._r.getparent().remove(r._r)
+
+    for i, line in enumerate(lines):
+        if i == 0:
+            p = first_p
+        else:
+            p = tf.add_paragraph()
+        run = p.add_run()
+        run.text = line
+        if not run.font.name and style.body_font:
+            run.font.name = style.body_font
+        if run.font.size is None and style.body_size:
+            run.font.size = style.body_size
+        try:
+            has_color = run.font.color and run.font.color.type is not None
+        except (AttributeError, TypeError):
+            has_color = False
+        if not has_color and style.body_color:
+            run.font.color.rgb = style.body_color
+
+
 def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_content: SlideContent, subtitle: str = ""):
     """Create a slide using the template's layouts and styles."""
+    # Section slides without a real Section Header layout would be
+    # indistinguishable from content slides; fall back to the default
+    # renderer so they still look like section dividers.
+    if slide_content.slide_type == "section" and not style.section_layout_found:
+        _add_section_slide_default(prs, slide_content)
+        return
+
     layouts = prs.slide_layouts
 
     if slide_content.slide_type == "title":
         layout_idx = style.title_layout_idx
+        title_size = style.title_size
     elif slide_content.slide_type == "section":
         layout_idx = style.section_layout_idx
+        title_size = style.section_title_size or style.title_size
     else:
         layout_idx = style.content_layout_idx
+        title_size = style.content_title_size or style.title_size
 
     layout_idx = min(layout_idx, len(layouts) - 1)
     slide = prs.slides.add_slide(layouts[layout_idx])
@@ -1143,41 +1285,47 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
     for ph in slide.placeholders:
         idx = ph.placeholder_format.idx
         if idx == 0:  # Title placeholder
-            ph.text = slide_content.title
-            # Apply template fonts
-            for para in ph.text_frame.paragraphs:
-                for run in para.runs:
-                    run.font.name = style.title_font
-                    if style.title_color:
-                        run.font.color.rgb = style.title_color
+            _set_placeholder_text(
+                ph, slide_content.title,
+                fallback_font=style.title_font,
+                fallback_size=title_size,
+                fallback_color=style.title_color,
+            )
         elif idx == 1:  # Body/subtitle placeholder
             if slide_content.slide_type == "title" and subtitle:
-                ph.text = subtitle
-                for para in ph.text_frame.paragraphs:
-                    for run in para.runs:
-                        run.font.name = style.body_font
-                        if style.body_color:
-                            run.font.color.rgb = style.body_color
+                _set_placeholder_text(
+                    ph, subtitle,
+                    fallback_font=style.body_font,
+                    fallback_size=style.body_size,
+                    fallback_color=style.body_color,
+                )
             elif slide_content.body_lines:
-                tf = ph.text_frame
-                tf.clear()
-                for i, line in enumerate(slide_content.body_lines):
-                    if i == 0:
-                        p = tf.paragraphs[0]
-                    else:
-                        p = tf.add_paragraph()
-                    p.text = line
-                    p.space_after = Pt(6)
-                    for run in p.runs:
-                        run.font.name = style.body_font
-                        run.font.size = style.body_size
-                        if style.body_color:
-                            run.font.color.rgb = style.body_color
+                _fill_body_placeholder(ph, slide_content.body_lines, style)
 
-    # If no body placeholder was found but we have body lines, add a text box
+    # Fallbacks for minimal layouts that have no title/body placeholders.
+    # Without these, H3 slide titles vanish silently because there's nowhere
+    # for the title to land.
+    title_ph_found = any(ph.placeholder_format.idx == 0 for ph in slide.placeholders)
     body_ph_found = any(ph.placeholder_format.idx == 1 for ph in slide.placeholders)
+
+    body_top = Inches(1.8)
+    if not title_ph_found and slide_content.title and slide_content.slide_type != "section":
+        title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(8.6), Inches(1.0))
+        ttf = title_box.text_frame
+        ttf.word_wrap = True
+        tp = ttf.paragraphs[0]
+        tp.alignment = PP_ALIGN.LEFT
+        trun = tp.add_run()
+        trun.text = slide_content.title
+        trun.font.name = style.title_font
+        trun.font.size = title_size or Pt(28)
+        trun.font.bold = True
+        if style.title_color:
+            trun.font.color.rgb = style.title_color
+        body_top = Inches(1.6)
+
     if not body_ph_found and slide_content.body_lines and slide_content.slide_type == "content":
-        txBox = slide.shapes.add_textbox(Inches(0.7), Inches(1.8), Inches(8.6), Inches(3.5))
+        txBox = slide.shapes.add_textbox(Inches(0.7), body_top, Inches(8.6), Inches(3.5))
         tf = txBox.text_frame
         tf.word_wrap = True
         for i, line in enumerate(slide_content.body_lines):
