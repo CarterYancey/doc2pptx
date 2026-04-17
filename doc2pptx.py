@@ -1302,10 +1302,30 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
             elif slide_content.body_lines:
                 _fill_body_placeholder(ph, slide_content.body_lines, style)
 
-    # If no body placeholder was found but we have body lines, add a text box
+    # Fallbacks for minimal layouts that have no title/body placeholders.
+    # Without these, H3 slide titles vanish silently because there's nowhere
+    # for the title to land.
+    title_ph_found = any(ph.placeholder_format.idx == 0 for ph in slide.placeholders)
     body_ph_found = any(ph.placeholder_format.idx == 1 for ph in slide.placeholders)
+
+    body_top = Inches(1.8)
+    if not title_ph_found and slide_content.title and slide_content.slide_type != "section":
+        title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(8.6), Inches(1.0))
+        ttf = title_box.text_frame
+        ttf.word_wrap = True
+        tp = ttf.paragraphs[0]
+        tp.alignment = PP_ALIGN.LEFT
+        trun = tp.add_run()
+        trun.text = slide_content.title
+        trun.font.name = style.title_font
+        trun.font.size = title_size or Pt(28)
+        trun.font.bold = True
+        if style.title_color:
+            trun.font.color.rgb = style.title_color
+        body_top = Inches(1.6)
+
     if not body_ph_found and slide_content.body_lines and slide_content.slide_type == "content":
-        txBox = slide.shapes.add_textbox(Inches(0.7), Inches(1.8), Inches(8.6), Inches(3.5))
+        txBox = slide.shapes.add_textbox(Inches(0.7), body_top, Inches(8.6), Inches(3.5))
         tf = txBox.text_frame
         tf.word_wrap = True
         for i, line in enumerate(slide_content.body_lines):
