@@ -15,17 +15,22 @@ from __future__ import annotations
 
 import argparse
 import copy
+import logging
 import os
 import re
 import sys
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree as ET
 
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -38,10 +43,19 @@ class SlideContent:
     title: str = ""
     body_lines: list[str] = field(default_factory=list)
     level: int = 0  # heading depth (1 = H1/title, 2 = H2/section, etc.)
-    slide_type: str = "content"  # "title", "section", "content", "table"
+    slide_type: str = "content"  # "title", "section", "content", "table", "quote", "bignum", "stat_grid"
     # Table data (used when slide_type == "table")
     table_headers: list[str] = field(default_factory=list)
     table_rows: list[list[str]] = field(default_factory=list)
+    # LLM-suggested layout hint from a {layout=... accent=...} attribute on
+    # the heading line. Untrusted — the renderer validates and snaps to an
+    # available layout, falling back silently if the hint is unknown.
+    layout_hint: str | None = None
+    accent_hint: int | None = None
+    # Creative content blocks parsed from the LLM output.
+    quote_text: str | None = None
+    big_number: tuple[str, str] | None = None  # (value, label)
+    stats: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -272,15 +286,30 @@ def read_document(path: str) -> str:
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
 
-DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly into a PowerPoint deck.
+DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts into a POWERFUL, VARIED PowerPoint deck — not a wall of bullet points.
 
-Rules:
+Output rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
-- Use `#` for the deck title, `##` for each slide title, `###` for sub-sections.
-- Under each slide title, write 3-7 bullet points starting with `- `.
+- Use `#` for the deck title and `##` for each slide title.
+- Tag every `##` heading with a layout hint in curly braces AT THE END OF THE LINE:
+    ## My slide title {layout=content}
+    ## Key metrics {layout=stat_grid accent=1}
+  Only use these layout values: title, section, content, two_content, comparison, picture_caption, quote, stat_grid, callout.
+  `accent` is an optional integer 1-6 selecting a theme accent color for decoration.
+- Under each `##`, write EITHER bullet lines starting with `- `, OR one of the special creative blocks below.
+
+Creative blocks (use them! variety is the goal):
+- Pull quote:  a single line starting with `> ` — use `{layout=quote}` on the heading.
+- Big number:  `[[BIG: 87% | retention after 30 days]]` on its own line — use `{layout=bignum}` on the heading.
+- Stat grid:   several `[[STAT: value | label]]` entries separated by spaces on one line — use `{layout=stat_grid}`.
+- Comparison:  two groups of bullets separated by a line `---` — use `{layout=comparison}` or `{layout=two_content}`.
+
+Content rules:
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
-- Do not leave any content out, but do summarize ideas instead of repeating verbatim.
+- Cover everything, but summarize instead of quoting verbatim.
 - Drop filler, repetition, and boilerplate.
+- Vary the layout across slides. Aim for at least 2 non-"content" layouts per 10 slides when the source material supports it (quotes → quote, statistics → stat_grid / bignum, side-by-side ideas → two_content / comparison).
+- A slide that introduces a new major part of the document → `## Title {layout=section}` with no bullets.
 """
 
 
@@ -289,19 +318,35 @@ def rewrite_for_pptx(
     host: str = DEFAULT_OLLAMA_HOST,
     model: str = DEFAULT_OLLAMA_MODEL,
     system_prompt: str | None = None,
+    template_kit: str | None = None,
     timeout: float = 120.0,
 ) -> str:
     """Ask a local Ollama server to reshape raw_text into PPT-friendly markdown.
+
+    When ``template_kit`` is supplied, it is injected into the system prompt
+    so the LLM knows which layouts and accent colors are actually available
+    in the uploaded template — steering it toward compliant, varied output.
 
     Returns the rewritten markdown. Raises on HTTP/connection errors — callers
     decide whether to fall back to the original text.
     """
     import httpx
 
+    base_prompt = system_prompt or DEFAULT_REWRITE_PROMPT
+    if template_kit:
+        full_prompt = (
+            f"{base_prompt}\n\n"
+            f"THIS TEMPLATE ADVERTISES:\n{template_kit}\n\n"
+            "Only use layout values that appear above. If the template does not "
+            "advertise a layout you want, fall back to `content` or `section`."
+        )
+    else:
+        full_prompt = base_prompt
+
     payload = {
         "model": model,
         "prompt": raw_text,
-        "system": system_prompt or DEFAULT_REWRITE_PROMPT,
+        "system": full_prompt,
         "stream": False,
         "options": {"temperature": 0.2},
     }
@@ -323,6 +368,50 @@ def _is_heading(line: str) -> tuple[int, str] | None:
     if m:
         return len(m.group(1)), m.group(2).strip()
     return None
+
+
+_HEADING_HINT_RE = re.compile(r"\s*\{([^{}]+)\}\s*$")
+_HINT_KV_RE = re.compile(r"(\w+)\s*=\s*([^\s]+)")
+_BIG_RE = re.compile(r"\[\[BIG:\s*([^|\]]+?)\s*\|\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
+_STAT_RE = re.compile(r"\[\[STAT:\s*([^|\]]+?)\s*\|\s*([^\]]+?)\s*\]\]", re.IGNORECASE)
+
+
+def _extract_heading_hints(text: str) -> tuple[str, str | None, int | None]:
+    """Pull a trailing ``{layout=… accent=…}`` attribute block off a heading.
+
+    Returns ``(clean_text, layout_hint, accent_hint)``. Unknown keys are
+    ignored silently so the LLM can include extras without breaking parsing.
+    """
+    m = _HEADING_HINT_RE.search(text)
+    if not m:
+        return text.strip(), None, None
+    inside = m.group(1)
+    clean = text[: m.start()].strip()
+    layout_hint: str | None = None
+    accent_hint: int | None = None
+    for key, val in _HINT_KV_RE.findall(inside):
+        key_l = key.lower()
+        if key_l == "layout":
+            layout_hint = val.lower()
+        elif key_l == "accent":
+            try:
+                accent_hint = max(1, min(6, int(val))) - 1  # 1-indexed in prompt, 0-indexed internally
+            except ValueError:
+                pass
+    return clean, layout_hint, accent_hint
+
+
+def _parse_stats_line(line: str) -> list[tuple[str, str]]:
+    """Return a list of (value, label) pairs from one or more [[STAT:]] tokens."""
+    return [(m.group(1).strip(), m.group(2).strip()) for m in _STAT_RE.finditer(line)]
+
+
+def _parse_big_line(line: str) -> tuple[str, str] | None:
+    """Return (value, label) from a [[BIG:]] token, or None."""
+    m = _BIG_RE.search(line)
+    if not m:
+        return None
+    return m.group(1).strip(), m.group(2).strip()
 
 
 def _is_bullet(line: str) -> str | None:
@@ -442,34 +531,116 @@ def _parse_markdown_structured(
     current_slide: SlideContent | None = None
     body_buffer: list[str] = []
 
+    # When the LLM uses `---` between two groups of bullets in a comparison
+    # slide, we stash the left column here and merge it back in flush_slide.
+    comparison_left: list[str] | None = None
+
+    def promote_slide_type(sc: SlideContent) -> None:
+        """Upgrade an assertion-level slide_type based on its body content
+        — e.g. a bullet-less blockquote becomes a quote slide — and fold
+        LLM creative blocks (BIG, STAT) into the right structured field."""
+        # Gather any [[BIG]] or [[STAT]] tokens from body lines.
+        big_found: tuple[str, str] | None = None
+        stats_found: list[tuple[str, str]] = []
+        surviving: list[str] = []
+        for ln in sc.body_lines:
+            stats = _parse_stats_line(ln)
+            if stats:
+                stats_found.extend(stats)
+                continue
+            big = _parse_big_line(ln)
+            if big is not None:
+                big_found = big
+                continue
+            surviving.append(ln)
+
+        if stats_found:
+            sc.stats = stats_found
+            if sc.layout_hint in (None, "content"):
+                sc.slide_type = "stat_grid"
+                sc.layout_hint = sc.layout_hint or "stat_grid"
+        if big_found is not None:
+            sc.big_number = big_found
+            if sc.layout_hint in (None, "content"):
+                sc.slide_type = "bignum"
+                sc.layout_hint = sc.layout_hint or "bignum"
+        sc.body_lines = surviving
+
+        # Honor explicit layout hints.
+        if sc.layout_hint == "section" and not sc.body_lines:
+            sc.slide_type = "section"
+        if sc.layout_hint == "quote" and sc.quote_text is None and sc.body_lines:
+            # Promote the first line as the quote if the LLM didn't use `> `.
+            sc.quote_text = sc.body_lines[0].lstrip("> ").strip()
+            sc.body_lines = sc.body_lines[1:]
+            sc.slide_type = "quote"
+        if sc.quote_text is not None:
+            sc.slide_type = "quote"
+
     def flush_slide():
-        nonlocal current_slide, body_buffer
+        nonlocal current_slide, body_buffer, comparison_left
         if current_slide is not None:
             current_slide.body_lines = body_buffer
+            if comparison_left is not None:
+                # Comparison: left column was already saved; the buffer is
+                # the right column. Encode as "LEFT: …" / "RIGHT: …" prefix
+                # so the renderer can split them back out.
+                left = comparison_left
+                right = body_buffer
+                current_slide.body_lines = (
+                    [f"__LEFT__{ln}" for ln in left]
+                    + [f"__RIGHT__{ln}" for ln in right]
+                )
+                if current_slide.layout_hint in (None, "content"):
+                    current_slide.layout_hint = "comparison"
+                    current_slide.slide_type = "content"
+                comparison_left = None
+
+            promote_slide_type(current_slide)
+
             # Drop the empty H2 companion content slide when no bullets
             # followed the section divider (avoids duplicate titles).
             if (
                 current_slide.level == 2
                 and current_slide.slide_type == "content"
-                and not body_buffer
+                and not current_slide.body_lines
+                and current_slide.quote_text is None
+                and current_slide.big_number is None
+                and not current_slide.stats
             ):
                 current_slide = None
                 body_buffer = []
                 return
-            chunks = _chunk_body_lines(current_slide.body_lines, max_bullets)
-            if len(chunks) == 1:
+
+            # Creative slide types shouldn't be chunked by bullet-count —
+            # they carry structured content that must stay intact. Same
+            # goes for two-column layouts: chunking would lose the
+            # __LEFT__/__RIGHT__ markers and collapse to one column.
+            creative_types = {"quote", "bignum", "stat_grid", "section"}
+            creative_hints = {"two_content", "comparison", "stat_grid", "bignum", "quote"}
+            if (
+                current_slide.slide_type in creative_types
+                or current_slide.layout_hint in creative_hints
+            ):
                 deck.slides.append(current_slide)
             else:
-                for idx, chunk in enumerate(chunks):
-                    s = SlideContent(
-                        title=current_slide.title + (f" (cont.)" if idx > 0 else ""),
-                        body_lines=chunk,
-                        level=current_slide.level,
-                        slide_type=current_slide.slide_type,
-                    )
-                    deck.slides.append(s)
+                chunks = _chunk_body_lines(current_slide.body_lines, max_bullets)
+                if len(chunks) == 1:
+                    deck.slides.append(current_slide)
+                else:
+                    for idx, chunk in enumerate(chunks):
+                        s = SlideContent(
+                            title=current_slide.title + (f" (cont.)" if idx > 0 else ""),
+                            body_lines=chunk,
+                            level=current_slide.level,
+                            slide_type=current_slide.slide_type,
+                            layout_hint=current_slide.layout_hint,
+                            accent_hint=current_slide.accent_hint,
+                        )
+                        deck.slides.append(s)
         current_slide = None
         body_buffer = []
+        comparison_left = None
 
     first_h1_seen = False
     for line in lines:
@@ -477,27 +648,68 @@ def _parse_markdown_structured(
         heading = _is_heading(stripped)
 
         if heading:
-            level, text = heading
+            level, raw_text = heading
+            text, layout_hint, accent_hint = _extract_heading_hints(raw_text)
             flush_slide()
             if level == 1:
                 if not first_h1_seen:
                     first_h1_seen = True
                     deck.title = deck.title or text
-                    current_slide = SlideContent(title=text, level=1, slide_type="title")
+                    current_slide = SlideContent(
+                        title=text, level=1, slide_type="title",
+                        layout_hint=layout_hint, accent_hint=accent_hint,
+                    )
                 else:
-                    current_slide = SlideContent(title=text, level=1, slide_type="section")
+                    current_slide = SlideContent(
+                        title=text, level=1, slide_type="section",
+                        layout_hint=layout_hint, accent_hint=accent_hint,
+                    )
             elif level == 2:
-                # H2 is always a section divider. Emit the section slide
-                # immediately, then start a companion content slide with the
-                # same title so any bullets before the next heading spill
-                # onto it. If no bullets arrive, flush_slide drops the empty
-                # companion to avoid a duplicate title slide.
-                deck.slides.append(
-                    SlideContent(title=text, level=2, slide_type="section")
-                )
-                current_slide = SlideContent(title=text, level=2, slide_type="content")
+                # H2 is a section divider by default. When the LLM tags the
+                # H2 with a creative layout (stat_grid, bignum, quote,
+                # two_content, …) the heading IS the creative slide — no
+                # section-divider companion. A plain H2 with no hint keeps
+                # the legacy behavior: emit a section slide, then a companion
+                # content slide for any following bullets.
+                if layout_hint is None:
+                    deck.slides.append(
+                        SlideContent(title=text, level=2, slide_type="section")
+                    )
+                    current_slide = SlideContent(
+                        title=text, level=2, slide_type="content",
+                        layout_hint=None, accent_hint=accent_hint,
+                    )
+                elif layout_hint == "section":
+                    current_slide = SlideContent(
+                        title=text, level=2, slide_type="section",
+                        layout_hint=layout_hint, accent_hint=accent_hint,
+                    )
+                else:
+                    current_slide = SlideContent(
+                        title=text, level=2, slide_type="content",
+                        layout_hint=layout_hint, accent_hint=accent_hint,
+                    )
             else:
-                current_slide = SlideContent(title=text, level=level, slide_type="content")
+                current_slide = SlideContent(
+                    title=text, level=level, slide_type="content",
+                    layout_hint=layout_hint, accent_hint=accent_hint,
+                )
+            continue
+
+        # Comparison column separator: `---` on its own line.
+        if stripped == "---" and current_slide is not None:
+            comparison_left = body_buffer
+            body_buffer = []
+            continue
+
+        # Blockquote → pull-quote slide content.
+        if stripped.startswith("> "):
+            if current_slide is None:
+                current_slide = SlideContent(title="", slide_type="quote")
+            current_slide.quote_text = stripped[2:].strip()
+            current_slide.slide_type = "quote"
+            if current_slide.layout_hint is None:
+                current_slide.layout_hint = "quote"
             continue
 
         bullet_text = _is_bullet(stripped)
@@ -643,28 +855,76 @@ def _parse_plain_text(
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
+class LayoutInfo:
+    """Everything we want to know about one slide layout in a template."""
+    idx: int
+    name: str
+    # List of (placeholder_idx, placeholder_type_str) tuples.
+    placeholders: list[tuple[int, str]] = field(default_factory=list)
+    # Inferred purpose tags, e.g. ["content", "two_content"]. Used by
+    # _choose_layout_by_hint to snap LLM hints to available layouts.
+    purposes: list[str] = field(default_factory=list)
+
+
+# Neutral fallback palette when theme1.xml is unreadable. Mid-tone enough
+# to read on both light and dark masters.
+_NEUTRAL_ACCENTS = [
+    RGBColor(0x2E, 0x5A, 0x87),  # slate blue
+    RGBColor(0xE8, 0x8B, 0x2C),  # amber
+    RGBColor(0x4E, 0x9C, 0x6B),  # green
+    RGBColor(0xB8, 0x3F, 0x3F),  # red
+    RGBColor(0x6F, 0x54, 0xA3),  # purple
+    RGBColor(0x4A, 0x75, 0x8A),  # teal
+]
+
+
+@dataclass
 class TemplateStyle:
     """Style information extracted from a template presentation."""
     presentation: Presentation
-    # Layout indices by purpose
+    # Layout indices by purpose (kept for backwards compat with callers).
     title_layout_idx: int = 0
     section_layout_idx: int = 0
     content_layout_idx: int = 1
     # Whether a real Section Header layout was found (vs. a fallback).
-    # When False, section slides use the default-style renderer so they
-    # still look distinct from plain content slides.
+    # When False, section slides are synthesized using the template's
+    # accent palette rather than the hardcoded navy default.
     section_layout_found: bool = False
-    # Fonts detected from template
+    # Fonts (theme fonts preferred; placeholder sniffing is the fallback).
     title_font: str = "Calibri"
     body_font: str = "Calibri"
+    major_font: str | None = None
+    minor_font: str | None = None
     title_size: Pt = field(default_factory=lambda: Pt(36))
     section_title_size: Pt | None = None
     content_title_size: Pt | None = None
     body_size: Pt = field(default_factory=lambda: Pt(16))
-    # Colors
+    # Placeholder-derived colors (may be None if not specified in layout).
     title_color: RGBColor | None = None
     body_color: RGBColor | None = None
-    background_fill: any = None
+    # Theme palette.
+    theme_colors: dict[str, RGBColor] = field(default_factory=dict)
+    accent_palette: list[RGBColor] = field(default_factory=list)
+    # Full layout catalog for hint-based selection.
+    layout_catalog: list[LayoutInfo] = field(default_factory=list)
+    # Rolling counter for cycling accents across repeated section/table
+    # slides, so a deck with 5 section dividers feels designed rather than
+    # repeating the same accent color every time.
+    _accent_cursor: int = 0
+
+    def next_accent(self) -> RGBColor:
+        """Return the next accent color in rotation (modulo palette length)."""
+        palette = self.accent_palette or _NEUTRAL_ACCENTS
+        color = palette[self._accent_cursor % len(palette)]
+        self._accent_cursor += 1
+        return color
+
+    def accent_at(self, idx: int | None) -> RGBColor:
+        """Return a specific accent by index, or the first accent if idx is None."""
+        palette = self.accent_palette or _NEUTRAL_ACCENTS
+        if idx is None:
+            return palette[0]
+        return palette[idx % len(palette)]
 
 
 def _find_best_layout(prs: Presentation, target: str) -> tuple[int, bool]:
@@ -700,6 +960,314 @@ def _find_best_layout(prs: Presentation, target: str) -> tuple[int, bool]:
     # Fallback: title=0, section=0, content=1 (or 0 if only one layout)
     fallback = {"title": 0, "section": 0, "content": min(1, len(layouts) - 1)}
     return fallback.get(target_lower, 0), False
+
+
+# ─────────────────────────────────────────────────────────────
+# Theme XML inspection
+# ─────────────────────────────────────────────────────────────
+
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+
+def _hex_to_rgb(hex_str: str) -> RGBColor | None:
+    """Parse a 6-char hex string into an RGBColor, or None on failure."""
+    if not hex_str:
+        return None
+    s = hex_str.strip().lstrip("#")
+    if len(s) != 6:
+        return None
+    try:
+        return RGBColor(int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _resolve_scheme_color(elem: ET.Element) -> RGBColor | None:
+    """Given a <a:dk1>, <a:accent1>, etc., return an RGBColor. Handles the
+    common srgbClr and sysClr (with lastClr fallback) variants. Returns None
+    if neither child is present or parses successfully."""
+    srgb = elem.find(f"{{{_A_NS}}}srgbClr")
+    if srgb is not None:
+        return _hex_to_rgb(srgb.get("val"))
+    sys_clr = elem.find(f"{{{_A_NS}}}sysClr")
+    if sys_clr is not None:
+        # lastClr is the RGB that was in effect when the file was saved —
+        # good enough as a deterministic mapping.
+        return _hex_to_rgb(sys_clr.get("lastClr") or sys_clr.get("val"))
+    return None
+
+
+def _read_theme_from_pptx(template_path: str) -> tuple[dict[str, RGBColor], str | None, str | None]:
+    """Pull the color and font scheme out of ppt/theme/theme1.xml.
+
+    Returns ``(color_map, major_font, minor_font)``. ``color_map`` maps
+    scheme slot names (dk1, lt1, accent1…accent6, hlink, folHlink) to
+    RGBColor. Missing or malformed themes come back as ``({}, None, None)``
+    — callers decide on fallbacks.
+    """
+    colors: dict[str, RGBColor] = {}
+    major = None
+    minor = None
+    try:
+        with zipfile.ZipFile(template_path) as zf:
+            # Pick the first ppt/theme/theme*.xml — almost always theme1.
+            theme_members = sorted(
+                n for n in zf.namelist() if n.startswith("ppt/theme/") and n.endswith(".xml")
+            )
+            if not theme_members:
+                return colors, major, minor
+            with zf.open(theme_members[0]) as fh:
+                root = ET.parse(fh).getroot()
+
+        theme_elem = root.find(f"{{{_A_NS}}}themeElements")
+        if theme_elem is None:
+            return colors, major, minor
+
+        clr_scheme = theme_elem.find(f"{{{_A_NS}}}clrScheme")
+        if clr_scheme is not None:
+            for child in clr_scheme:
+                tag = child.tag.split("}", 1)[-1]
+                rgb = _resolve_scheme_color(child)
+                if rgb is not None:
+                    colors[tag] = rgb
+
+        font_scheme = theme_elem.find(f"{{{_A_NS}}}fontScheme")
+        if font_scheme is not None:
+            for child, key in (
+                (font_scheme.find(f"{{{_A_NS}}}majorFont"), "major"),
+                (font_scheme.find(f"{{{_A_NS}}}minorFont"), "minor"),
+            ):
+                if child is None:
+                    continue
+                latin = child.find(f"{{{_A_NS}}}latin")
+                if latin is not None and latin.get("typeface"):
+                    if key == "major":
+                        major = latin.get("typeface")
+                    else:
+                        minor = latin.get("typeface")
+    except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError) as exc:
+        logger.warning("Could not parse theme from %s: %s", template_path, exc)
+
+    return colors, major, minor
+
+
+def _read_master_clr_map(prs: Presentation) -> dict[str, str]:
+    """Read the slide master's clrMap — it remaps theme scheme slots to
+    the names used in shapes (e.g. `accent1` in a shape may actually
+    resolve to theme's `accent3`). Returns a dict like
+    ``{"accent1": "accent1", "bg1": "lt1", …}``.
+
+    Returns an empty dict if no master or no clrMap is present; callers
+    should then use the theme's native slots directly.
+    """
+    if not prs.slide_masters:
+        return {}
+    # Pick master 0 — multi-master templates are rare; if present, master 0
+    # is typically the primary. A more sophisticated future change could
+    # pick the master that the most layouts reference.
+    master = prs.slide_masters[0]
+    clr_map = master.element.find(f"{{{_P_NS}}}clrMap")
+    if clr_map is None:
+        return {}
+    return dict(clr_map.attrib)
+
+
+def _build_accent_palette(
+    theme_colors: dict[str, RGBColor], clr_map: dict[str, str]
+) -> list[RGBColor]:
+    """Assemble accent1..accent6 from the theme, honoring the master's
+    color map. Falls back to neutral accents when nothing resolvable."""
+    palette: list[RGBColor] = []
+    for i in range(1, 7):
+        key = f"accent{i}"
+        # clrMap may remap "accent1" → some other slot; if missing, use
+        # the theme's own key.
+        theme_key = clr_map.get(key, key)
+        rgb = theme_colors.get(theme_key) or theme_colors.get(key)
+        if rgb is not None:
+            palette.append(rgb)
+    if not palette:
+        return list(_NEUTRAL_ACCENTS)
+    return palette
+
+
+# ─────────────────────────────────────────────────────────────
+# Layout catalog
+# ─────────────────────────────────────────────────────────────
+
+# Ordered so that higher-score purposes are preferred when multiple tie.
+_PURPOSE_NAME_KEYWORDS: dict[str, list[str]] = {
+    "title": ["title slide", "title", "cover"],
+    "section": ["section header", "section", "divider"],
+    "two_content": ["two content", "two-content", "comparison", "side by side", "two column"],
+    "comparison": ["comparison", "versus", " vs "],
+    "picture_caption": ["picture with caption", "picture", "photo", "image"],
+    "quote": ["quote", "pull quote", "testimonial"],
+    "stat_grid": ["stat", "metrics", "numbers", "kpi"],
+    "callout": ["callout", "highlight", "spotlight"],
+    "content": [
+        "title and content", "title, content", "title and body",
+        "content", "text",
+    ],
+    "blank": ["blank"],
+}
+
+
+def _placeholder_type_name(ph) -> str:
+    """Return a short string for a placeholder's type (BODY, PICTURE, etc.).
+    Falls back to the numeric repr if the enum is unavailable."""
+    try:
+        t = ph.placeholder_format.type
+    except Exception:
+        return "UNKNOWN"
+    if t is None:
+        return "UNKNOWN"
+    # t is an enum value; str() gives e.g. "BODY (2)"
+    return str(t).split(" ")[0]
+
+
+def _score_layout_purposes(name: str, ph_types: list[str]) -> list[str]:
+    """Score each candidate purpose and return the ones that pass threshold.
+
+    Scoring (heuristic but stable):
+      + 3 per name keyword match
+      + 4 if placeholder signature strongly implies the purpose
+      + 2 for weaker signature matches
+    Purposes that score > 0 are returned, highest-first.
+    """
+    scores: dict[str, int] = {}
+    name_lower = (name or "").lower()
+
+    # Name keyword signals.
+    for purpose, kws in _PURPOSE_NAME_KEYWORDS.items():
+        for kw in kws:
+            if kw in name_lower:
+                scores[purpose] = scores.get(purpose, 0) + 3
+                break
+
+    # Placeholder-signature signals.
+    body_count = ph_types.count("BODY") + ph_types.count("OBJECT")
+    has_picture = "PICTURE" in ph_types
+    has_chart = "CHART" in ph_types
+    has_table = "TABLE" in ph_types
+    has_title = "TITLE" in ph_types or "CENTER_TITLE" in ph_types
+    has_subtitle = "SUBTITLE" in ph_types
+    total = len(ph_types)
+
+    if has_picture:
+        scores["picture_caption"] = scores.get("picture_caption", 0) + 4
+    if body_count >= 2:
+        scores["two_content"] = scores.get("two_content", 0) + 4
+        scores["comparison"] = scores.get("comparison", 0) + 2
+    if body_count >= 1 and has_title and not has_picture:
+        scores["content"] = scores.get("content", 0) + 3
+    if has_title and body_count == 0 and not has_subtitle and total <= 2:
+        # A title-only or title+decoration layout — good section divider
+        # material whether or not the name says "section".
+        scores["section"] = scores.get("section", 0) + 2
+        scores["quote"] = scores.get("quote", 0) + 1
+    if has_subtitle and has_title and body_count == 0:
+        scores["title"] = scores.get("title", 0) + 4
+    if has_chart or has_table:
+        scores["stat_grid"] = scores.get("stat_grid", 0) + 3
+    if total == 0:
+        scores["blank"] = scores.get("blank", 0) + 5
+
+    # Return purposes with any score, ordered by descending score.
+    return [p for p, _ in sorted(scores.items(), key=lambda kv: -kv[1]) if scores[p] > 0]
+
+
+def _build_layout_catalog(prs: Presentation) -> list[LayoutInfo]:
+    """Enumerate every slide layout and score its purpose tags."""
+    catalog: list[LayoutInfo] = []
+    for idx, layout in enumerate(prs.slide_layouts):
+        ph_tuples: list[tuple[int, str]] = []
+        ph_types: list[str] = []
+        for ph in layout.placeholders:
+            try:
+                ph_idx = ph.placeholder_format.idx
+            except Exception:
+                continue
+            type_name = _placeholder_type_name(ph)
+            ph_tuples.append((ph_idx, type_name))
+            ph_types.append(type_name)
+        purposes = _score_layout_purposes(layout.name or "", ph_types)
+        catalog.append(LayoutInfo(
+            idx=idx,
+            name=layout.name or f"Layout {idx}",
+            placeholders=ph_tuples,
+            purposes=purposes,
+        ))
+    return catalog
+
+
+def _choose_layout_by_hint(
+    catalog: list[LayoutInfo],
+    hint: str | None,
+    default_purpose: str = "content",
+) -> LayoutInfo:
+    """Pick the best layout for the requested hint.
+
+    ``hint`` is untrusted (typically from the LLM). Unknown values are
+    silently downgraded to ``default_purpose``. When no layout in the
+    catalog advertises the desired purpose, the function logs a warning
+    and returns the simplest-signature layout so the slide still lands
+    somewhere sensible.
+    """
+    if not catalog:
+        raise ValueError("Empty layout catalog — template has no layouts.")
+
+    # Known hints include every purpose we score in the catalog, plus a
+    # handful of synonyms emitted by the creative renderers themselves
+    # (``bignum`` lands on any single-emphasis layout; ``callout`` on a
+    # minimal body). These aren't scored from placeholder signatures but
+    # they're legitimate requests from callers.
+    known = set(_PURPOSE_NAME_KEYWORDS.keys()) | {"bignum"}
+    requested = hint if hint in known else default_purpose
+    if hint and hint not in known:
+        logger.warning("Unknown layout hint %r; falling back to %r", hint, default_purpose)
+
+    # First try the exact requested purpose.
+    for purpose in (requested, default_purpose, "content", "blank"):
+        for entry in catalog:
+            if purpose in entry.purposes:
+                return entry
+
+    # Nothing matched even "content" — return the layout with the fewest
+    # placeholders (most generic), which is the safest empty canvas.
+    return min(catalog, key=lambda li: len(li.placeholders))
+
+
+def render_template_kit(style: TemplateStyle) -> str:
+    """Produce a compact, human-readable summary of the template suitable
+    for injecting into an LLM system prompt. Kept tight so it doesn't
+    blow the context budget of small local models."""
+    palette = style.accent_palette or _NEUTRAL_ACCENTS
+    hex_palette = ", ".join(
+        "#{:02X}{:02X}{:02X}".format(*[int(c) for c in (rgb[0], rgb[1], rgb[2])])
+        for rgb in palette
+    )
+    major = style.major_font or style.title_font
+    minor = style.minor_font or style.body_font
+    purposes_seen: dict[str, str] = {}
+    for entry in style.layout_catalog:
+        for purpose in entry.purposes:
+            purposes_seen.setdefault(purpose, entry.name)
+    lines = [
+        f"Template fonts: major={major}, minor={minor}",
+        f"Template accent palette: {hex_palette}",
+        "Available slide layouts in this template (use these purpose tags):",
+    ]
+    # Preferred presentation order.
+    order = [
+        "title", "section", "content", "two_content", "comparison",
+        "picture_caption", "quote", "stat_grid", "callout", "blank",
+    ]
+    for p in order:
+        if p in purposes_seen:
+            lines.append(f"  - {p:<16} (e.g. \"{purposes_seen[p]}\")")
+    return "\n".join(lines)
 
 
 def _layout_title_size(layout) -> Pt | None:
@@ -770,10 +1338,25 @@ def _extract_font_info(prs: Presentation) -> dict:
 
 
 def analyze_template(template_path: str) -> TemplateStyle:
-    """Load a .pptx template and extract its style information."""
+    """Load a .pptx template and extract its style information.
+
+    Goes beyond placeholder sniffing: also reads the theme's color scheme
+    and font scheme, honors the master's clrMap remapping, and builds a
+    full layout catalog with purpose tags. The result is rich enough to
+    drive hint-based creative slide generation.
+    """
     prs = Presentation(template_path)
     font_info = _extract_font_info(prs)
 
+    theme_colors, major_font, minor_font = _read_theme_from_pptx(template_path)
+    clr_map = _read_master_clr_map(prs)
+    accent_palette = _build_accent_palette(theme_colors, clr_map)
+
+    catalog = _build_layout_catalog(prs)
+
+    # Keep the legacy by-purpose indices so downstream callers that still
+    # reach into style.title_layout_idx / section_layout_idx / content_layout_idx
+    # keep working without modification.
     title_idx, _ = _find_best_layout(prs, "title")
     section_idx, section_found = _find_best_layout(prs, "section")
     content_idx, _ = _find_best_layout(prs, "content")
@@ -784,20 +1367,31 @@ def analyze_template(template_path: str) -> TemplateStyle:
     )
     content_title_size = _layout_title_size(layouts[content_idx])
 
+    # Prefer theme-declared fonts, but keep placeholder-sniffed names as
+    # a fallback — Office themes sometimes declare generic fonts like
+    # "+mn-lt" that aren't useful to python-pptx's run.font.name.
+    title_font = major_font or font_info["title_font"]
+    body_font = minor_font or font_info["body_font"]
+
     style = TemplateStyle(
         presentation=prs,
         title_layout_idx=title_idx,
         section_layout_idx=section_idx,
         content_layout_idx=content_idx,
         section_layout_found=section_found,
-        title_font=font_info["title_font"],
-        body_font=font_info["body_font"],
+        title_font=title_font,
+        body_font=body_font,
+        major_font=major_font,
+        minor_font=minor_font,
         title_size=font_info["title_size"],
         section_title_size=section_title_size,
         content_title_size=content_title_size,
         body_size=font_info["body_size"],
         title_color=font_info["title_color"],
         body_color=font_info["body_color"],
+        theme_colors=theme_colors,
+        accent_palette=accent_palette,
+        layout_catalog=catalog,
     )
     return style
 
@@ -1165,8 +1759,11 @@ def _add_table_slide_from_template(prs: Presentation, style: TemplateStyle, slid
     row_height_estimate = min(0.35, available_height / (n_rows + 1))
     table_height = row_height_estimate * (n_rows + 1)
 
-    # Derive header background from template title color or fall back to navy
-    header_bg = style.title_color or RGBColor(0x1E, 0x27, 0x61)
+    # Header background comes from the template's accent palette (cycling
+    # each time a table is drawn so repeated table slides in one deck don't
+    # all wear the same color). Falls back through the rotation helper to
+    # the neutral palette if theme parsing failed.
+    header_bg = style.next_accent()
 
     _build_table_on_slide(
         slide,
@@ -1257,66 +1854,431 @@ def _fill_body_placeholder(ph, lines: list[str], style: TemplateStyle):
             run.font.color.rgb = style.body_color
 
 
-def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_content: SlideContent, subtitle: str = ""):
-    """Create a slide using the template's layouts and styles."""
-    # Section slides without a real Section Header layout would be
-    # indistinguishable from content slides; fall back to the default
-    # renderer so they still look like section dividers.
-    if slide_content.slide_type == "section" and not style.section_layout_found:
-        _add_section_slide_default(prs, slide_content)
+def _slide_dims(prs: Presentation) -> tuple[float, float]:
+    """Return (width_in, height_in) of the presentation slides."""
+    return prs.slide_width / 914400.0, prs.slide_height / 914400.0
+
+
+def _pick_layout(style: TemplateStyle, hint: str | None, default: str):
+    """Resolve a slide's layout_hint (+ default purpose) to an actual layout
+    object. Returns (layout_info, layout_obj)."""
+    info = _choose_layout_by_hint(style.layout_catalog, hint, default)
+    layout_obj = style.presentation.slide_layouts[info.idx]
+    return info, layout_obj
+
+
+def _add_quote_slide_from_template(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent,
+):
+    """Render a pull-quote slide: large centered quotation in the theme's
+    major font, colored with an accent, with a short accent bar on the left."""
+    info, layout = _pick_layout(style, sc.layout_hint or "quote", "section")
+    slide = prs.slides.add_slide(layout)
+    width_in, height_in = _slide_dims(prs)
+    accent = style.accent_at(sc.accent_hint)
+
+    # Wipe the layout's placeholders' default text so we can lay our own out.
+    for ph in list(slide.placeholders):
+        if ph.has_text_frame:
+            ph.text_frame.clear()
+
+    # Accent bar on the left.
+    bar = slide.shapes.add_shape(
+        1,  # MSO_SHAPE.RECTANGLE
+        Inches(0.8), Inches(height_in * 0.38),
+        Inches(0.12), Inches(height_in * 0.25),
+    )
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = accent
+    bar.line.fill.background()
+
+    # Quote text box.
+    tb = slide.shapes.add_textbox(
+        Inches(1.2), Inches(height_in * 0.30),
+        Inches(width_in - 2.0), Inches(height_in * 0.40),
+    )
+    tf = tb.text_frame
+    tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.LEFT
+    run = p.add_run()
+    run.text = f"\u201c{sc.quote_text or sc.title}\u201d"
+    run.font.name = style.major_font or style.title_font
+    run.font.size = Pt(32)
+    run.font.color.rgb = accent
+    run.font.italic = True
+
+    # Slide title (the heading, if distinct from the quote) as a small
+    # caption above the quote rather than an attribution — the heading is
+    # the slide's topic, not the quote's author.
+    if sc.title and sc.quote_text and sc.title != sc.quote_text:
+        cap_tb = slide.shapes.add_textbox(
+            Inches(1.2), Inches(height_in * 0.18),
+            Inches(width_in - 2.4), Inches(0.6),
+        )
+        cap_tf = cap_tb.text_frame
+        cap_tf.word_wrap = True
+        cp = cap_tf.paragraphs[0]
+        cp.alignment = PP_ALIGN.LEFT
+        crun = cp.add_run()
+        crun.text = sc.title
+        crun.font.name = style.body_font
+        crun.font.size = Pt(16)
+        crun.font.bold = True
+        if style.body_color:
+            crun.font.color.rgb = style.body_color
+
+
+def _add_bignum_slide_from_template(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent,
+):
+    """Render a big-number slide: one huge centered figure over a small label."""
+    info, layout = _pick_layout(style, sc.layout_hint or "callout", "section")
+    slide = prs.slides.add_slide(layout)
+    width_in, height_in = _slide_dims(prs)
+    accent = style.accent_at(sc.accent_hint)
+
+    for ph in list(slide.placeholders):
+        if ph.has_text_frame:
+            ph.text_frame.clear()
+
+    # Optional slide title above.
+    if sc.title:
+        title_tb = slide.shapes.add_textbox(
+            Inches(0.7), Inches(0.4), Inches(width_in - 1.4), Inches(0.8),
+        )
+        ttf = title_tb.text_frame
+        ttf.word_wrap = True
+        tp = ttf.paragraphs[0]
+        tp.alignment = PP_ALIGN.LEFT
+        trun = tp.add_run()
+        trun.text = sc.title
+        trun.font.name = style.title_font
+        trun.font.size = Pt(20)
+        if style.title_color:
+            trun.font.color.rgb = style.title_color
+
+    value, label = sc.big_number or ("", "")
+    # Big number.
+    num_tb = slide.shapes.add_textbox(
+        Inches(0.7), Inches(height_in * 0.28),
+        Inches(width_in - 1.4), Inches(height_in * 0.38),
+    )
+    ntf = num_tb.text_frame
+    ntf.word_wrap = True
+    ntf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    np_ = ntf.paragraphs[0]
+    np_.alignment = PP_ALIGN.CENTER
+    nrun = np_.add_run()
+    nrun.text = value
+    nrun.font.name = style.major_font or style.title_font
+    nrun.font.size = Pt(108)
+    nrun.font.bold = True
+    nrun.font.color.rgb = accent
+
+    # Label.
+    lab_tb = slide.shapes.add_textbox(
+        Inches(0.7), Inches(height_in * 0.70),
+        Inches(width_in - 1.4), Inches(0.8),
+    )
+    ltf = lab_tb.text_frame
+    ltf.word_wrap = True
+    lp = ltf.paragraphs[0]
+    lp.alignment = PP_ALIGN.CENTER
+    lrun = lp.add_run()
+    lrun.text = label
+    lrun.font.name = style.body_font
+    lrun.font.size = Pt(20)
+    if style.body_color:
+        lrun.font.color.rgb = style.body_color
+
+
+def _add_stat_grid_slide_from_template(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent,
+):
+    """Render a grid of 2–6 big numbers, each in a rotating accent color."""
+    info, layout = _pick_layout(style, sc.layout_hint or "stat_grid", "content")
+    slide = prs.slides.add_slide(layout)
+    width_in, height_in = _slide_dims(prs)
+
+    for ph in list(slide.placeholders):
+        if ph.has_text_frame:
+            ph.text_frame.clear()
+
+    # Title bar at top.
+    if sc.title:
+        tb = slide.shapes.add_textbox(
+            Inches(0.7), Inches(0.4), Inches(width_in - 1.4), Inches(0.8),
+        )
+        ttf = tb.text_frame
+        ttf.word_wrap = True
+        tp = ttf.paragraphs[0]
+        tp.alignment = PP_ALIGN.LEFT
+        trun = tp.add_run()
+        trun.text = sc.title
+        trun.font.name = style.title_font
+        trun.font.size = Pt(24)
+        trun.font.bold = True
+        if style.title_color:
+            trun.font.color.rgb = style.title_color
+
+    stats = sc.stats or []
+    if not stats:
         return
 
-    layouts = prs.slide_layouts
+    n = max(1, min(6, len(stats)))
+    cols = n if n <= 3 else (n + 1) // 2
+    rows = 1 if n <= 3 else 2
+    palette = style.accent_palette or _NEUTRAL_ACCENTS
 
-    if slide_content.slide_type == "title":
-        layout_idx = style.title_layout_idx
+    grid_top = 1.6
+    grid_height = height_in - grid_top - 0.4
+    cell_w = (width_in - 1.4) / cols
+    cell_h = grid_height / rows
+
+    for i, (value, label) in enumerate(stats[:n]):
+        r, c = divmod(i, cols)
+        left = 0.7 + c * cell_w
+        top = grid_top + r * cell_h
+        # Value
+        vtb = slide.shapes.add_textbox(
+            Inches(left), Inches(top),
+            Inches(cell_w - 0.2), Inches(cell_h * 0.55),
+        )
+        vtf = vtb.text_frame
+        vtf.word_wrap = True
+        vtf.vertical_anchor = MSO_ANCHOR.BOTTOM
+        vp = vtf.paragraphs[0]
+        vp.alignment = PP_ALIGN.CENTER
+        vrun = vp.add_run()
+        vrun.text = value
+        vrun.font.name = style.major_font or style.title_font
+        vrun.font.size = Pt(56 if cols <= 2 else 40)
+        vrun.font.bold = True
+        vrun.font.color.rgb = palette[i % len(palette)]
+        # Label
+        ltb = slide.shapes.add_textbox(
+            Inches(left), Inches(top + cell_h * 0.58),
+            Inches(cell_w - 0.2), Inches(cell_h * 0.35),
+        )
+        ltf = ltb.text_frame
+        ltf.word_wrap = True
+        lp = ltf.paragraphs[0]
+        lp.alignment = PP_ALIGN.CENTER
+        lrun = lp.add_run()
+        lrun.text = label
+        lrun.font.name = style.body_font
+        lrun.font.size = Pt(14)
+        if style.body_color:
+            lrun.font.color.rgb = style.body_color
+
+
+def _split_comparison_lines(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Split the __LEFT__/__RIGHT__-prefixed lines produced by the parser
+    back into two column lists."""
+    left = [ln[len("__LEFT__"):] for ln in lines if ln.startswith("__LEFT__")]
+    right = [ln[len("__RIGHT__"):] for ln in lines if ln.startswith("__RIGHT__")]
+    return left, right
+
+
+def _add_two_column_slide_from_template(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent, purpose: str,
+):
+    """Render a two-column layout (two_content or comparison). Prefers a
+    template layout with two BODY placeholders; synthesizes text boxes on a
+    simpler layout when none exists."""
+    info, layout = _pick_layout(style, purpose, "content")
+    slide = prs.slides.add_slide(layout)
+    width_in, height_in = _slide_dims(prs)
+    accent = style.accent_at(sc.accent_hint)
+
+    left_lines, right_lines = _split_comparison_lines(sc.body_lines)
+    if not left_lines and not right_lines:
+        # LLM used `{layout=two_content}` without `---`; fall back to splitting
+        # the bullets in half so the slide still renders with two columns.
+        mid = len(sc.body_lines) // 2 or 1
+        left_lines = sc.body_lines[:mid]
+        right_lines = sc.body_lines[mid:]
+
+    # Try to use two body placeholders if the layout advertises them.
+    body_phs = [
+        ph for ph in slide.placeholders
+        if ph.placeholder_format.idx != 0 and ph.has_text_frame
+    ]
+    title_ph = next(
+        (ph for ph in slide.placeholders if ph.placeholder_format.idx == 0),
+        None,
+    )
+
+    if title_ph and sc.title:
+        _set_placeholder_text(
+            title_ph, sc.title,
+            fallback_font=style.title_font,
+            fallback_size=style.content_title_size or style.title_size,
+            fallback_color=style.title_color,
+        )
+
+    if len(body_phs) >= 2:
+        _fill_body_placeholder(body_phs[0], left_lines or [""], style)
+        _fill_body_placeholder(body_phs[1], right_lines or [""], style)
+    else:
+        # Synthesize two text boxes side-by-side.
+        if title_ph is None and sc.title:
+            ttb = slide.shapes.add_textbox(
+                Inches(0.7), Inches(0.4), Inches(width_in - 1.4), Inches(0.8),
+            )
+            ttf = ttb.text_frame
+            ttf.word_wrap = True
+            tp = ttf.paragraphs[0]
+            tp.alignment = PP_ALIGN.LEFT
+            trun = tp.add_run()
+            trun.text = sc.title
+            trun.font.name = style.title_font
+            trun.font.size = Pt(24)
+            trun.font.bold = True
+            if style.title_color:
+                trun.font.color.rgb = style.title_color
+
+        col_top = 1.4
+        col_w = (width_in - 1.8) / 2
+        col_h = height_in - col_top - 0.4
+        for col_idx, col_lines in enumerate((left_lines, right_lines)):
+            left = 0.7 + col_idx * (col_w + 0.4)
+            # Divider bar for comparison layouts — emphasizes the split.
+            if purpose == "comparison" and col_idx == 0:
+                div = slide.shapes.add_shape(
+                    1,
+                    Inches(left + col_w + 0.15),
+                    Inches(col_top),
+                    Inches(0.06),
+                    Inches(col_h),
+                )
+                div.fill.solid()
+                div.fill.fore_color.rgb = accent
+                div.line.fill.background()
+            tb = slide.shapes.add_textbox(
+                Inches(left), Inches(col_top),
+                Inches(col_w), Inches(col_h),
+            )
+            tf = tb.text_frame
+            tf.word_wrap = True
+            for i, line in enumerate(col_lines):
+                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                p.alignment = PP_ALIGN.LEFT
+                p.space_after = Pt(6)
+                run = p.add_run()
+                run.text = f"•  {line}"
+                run.font.name = style.body_font
+                run.font.size = style.body_size
+                if style.body_color:
+                    run.font.color.rgb = style.body_color
+
+
+def _add_section_slide_synthesized(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent,
+):
+    """When the template advertises no Section Header layout, synthesize one
+    on the simplest available layout using the template's accent palette —
+    this is the template-aware replacement for the hardcoded navy default
+    path at _add_section_slide_default."""
+    # Prefer any layout tagged section/blank/title in the catalog — we want
+    # something with minimal placeholders so we can lay out our own.
+    info = _choose_layout_by_hint(style.layout_catalog, "blank", "section")
+    layout = prs.slide_layouts[info.idx]
+    slide = prs.slides.add_slide(layout)
+    width_in, height_in = _slide_dims(prs)
+    accent = style.next_accent()
+
+    # Clear any inherited placeholder text so only our shapes show.
+    for ph in list(slide.placeholders):
+        if ph.has_text_frame:
+            ph.text_frame.clear()
+
+    # Large accent bar.
+    bar = slide.shapes.add_shape(
+        1,
+        Inches(0.8), Inches(height_in * 0.42),
+        Inches(1.8), Inches(0.08),
+    )
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = accent
+    bar.line.fill.background()
+
+    # Section title, below the bar.
+    tb = slide.shapes.add_textbox(
+        Inches(0.8), Inches(height_in * 0.46),
+        Inches(width_in - 1.6), Inches(height_in * 0.35),
+    )
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.LEFT
+    run = p.add_run()
+    run.text = sc.title
+    run.font.name = style.major_font or style.title_font
+    run.font.size = Pt(40)
+    run.font.bold = True
+    # Title color: prefer explicit title_color, else a dark theme color that
+    # contrasts with likely backgrounds, else the accent itself.
+    if style.title_color:
+        run.font.color.rgb = style.title_color
+    else:
+        run.font.color.rgb = accent
+
+
+def _add_standard_slide_from_template(
+    prs: Presentation, style: TemplateStyle, sc: SlideContent, subtitle: str = "",
+):
+    """The original title/section/content renderer, adapted to use the
+    layout catalog so it can pick any content-capable layout (not just the
+    single content_layout_idx)."""
+    if sc.slide_type == "title":
+        info, layout = _pick_layout(style, sc.layout_hint or "title", "title")
         title_size = style.title_size
-    elif slide_content.slide_type == "section":
-        layout_idx = style.section_layout_idx
+    elif sc.slide_type == "section":
+        info, layout = _pick_layout(style, sc.layout_hint or "section", "section")
         title_size = style.section_title_size or style.title_size
     else:
-        layout_idx = style.content_layout_idx
+        info, layout = _pick_layout(style, sc.layout_hint or "content", "content")
         title_size = style.content_title_size or style.title_size
 
-    layout_idx = min(layout_idx, len(layouts) - 1)
-    slide = prs.slides.add_slide(layouts[layout_idx])
+    slide = prs.slides.add_slide(layout)
 
-    # Fill placeholders
+    # Fill placeholders.
     for ph in slide.placeholders:
         idx = ph.placeholder_format.idx
-        if idx == 0:  # Title placeholder
+        if idx == 0:
             _set_placeholder_text(
-                ph, slide_content.title,
+                ph, sc.title,
                 fallback_font=style.title_font,
                 fallback_size=title_size,
                 fallback_color=style.title_color,
             )
-        elif idx == 1:  # Body/subtitle placeholder
-            if slide_content.slide_type == "title" and subtitle:
+        elif idx == 1:
+            if sc.slide_type == "title" and subtitle:
                 _set_placeholder_text(
                     ph, subtitle,
                     fallback_font=style.body_font,
                     fallback_size=style.body_size,
                     fallback_color=style.body_color,
                 )
-            elif slide_content.body_lines:
-                _fill_body_placeholder(ph, slide_content.body_lines, style)
+            elif sc.body_lines:
+                _fill_body_placeholder(ph, sc.body_lines, style)
 
     # Fallbacks for minimal layouts that have no title/body placeholders.
-    # Without these, H3 slide titles vanish silently because there's nowhere
-    # for the title to land.
     title_ph_found = any(ph.placeholder_format.idx == 0 for ph in slide.placeholders)
     body_ph_found = any(ph.placeholder_format.idx == 1 for ph in slide.placeholders)
 
     body_top = Inches(1.8)
-    if not title_ph_found and slide_content.title and slide_content.slide_type != "section":
+    if not title_ph_found and sc.title and sc.slide_type != "section":
         title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(8.6), Inches(1.0))
         ttf = title_box.text_frame
         ttf.word_wrap = True
         tp = ttf.paragraphs[0]
         tp.alignment = PP_ALIGN.LEFT
         trun = tp.add_run()
-        trun.text = slide_content.title
+        trun.text = sc.title
         trun.font.name = style.title_font
         trun.font.size = title_size or Pt(28)
         trun.font.bold = True
@@ -1324,15 +2286,12 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
             trun.font.color.rgb = style.title_color
         body_top = Inches(1.6)
 
-    if not body_ph_found and slide_content.body_lines and slide_content.slide_type == "content":
+    if not body_ph_found and sc.body_lines and sc.slide_type == "content":
         txBox = slide.shapes.add_textbox(Inches(0.7), body_top, Inches(8.6), Inches(3.5))
         tf = txBox.text_frame
         tf.word_wrap = True
-        for i, line in enumerate(slide_content.body_lines):
-            if i == 0:
-                p = tf.paragraphs[0]
-            else:
-                p = tf.add_paragraph()
+        for i, line in enumerate(sc.body_lines):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
             run = p.add_run()
             run.text = f"•  {line}"
             run.font.name = style.body_font
@@ -1340,6 +2299,44 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
             if style.body_color:
                 run.font.color.rgb = style.body_color
             p.space_after = Pt(6)
+
+
+def _add_slide_from_template(
+    prs: Presentation, style: TemplateStyle, slide_content: SlideContent, subtitle: str = "",
+):
+    """Top-level dispatch for template-driven slides: reads the slide's
+    layout_hint (from the LLM or parser heuristics), snaps it to an
+    available layout, and routes to the appropriate creative renderer."""
+    # Section slides: when the template advertises no real Section Header
+    # layout, synthesize one using theme accent colors — this replaces the
+    # old hardcoded navy default fallback.
+    if slide_content.slide_type == "section":
+        if style.section_layout_found:
+            _add_standard_slide_from_template(prs, style, slide_content, subtitle)
+        else:
+            _add_section_slide_synthesized(prs, style, slide_content)
+        return
+
+    # Creative slide types produced by the parser / LLM.
+    if slide_content.slide_type == "quote" or slide_content.quote_text:
+        _add_quote_slide_from_template(prs, style, slide_content)
+        return
+    if slide_content.slide_type == "bignum" or slide_content.big_number is not None:
+        _add_bignum_slide_from_template(prs, style, slide_content)
+        return
+    if slide_content.slide_type == "stat_grid" or slide_content.stats:
+        _add_stat_grid_slide_from_template(prs, style, slide_content)
+        return
+
+    # Two-column layouts driven purely by hint.
+    if slide_content.layout_hint in ("two_content", "comparison"):
+        _add_two_column_slide_from_template(
+            prs, style, slide_content, slide_content.layout_hint,
+        )
+        return
+
+    # Everything else: standard title / content via the layout catalog.
+    _add_standard_slide_from_template(prs, style, slide_content, subtitle)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1379,6 +2376,19 @@ def generate_pptx(
     ext = Path(input_path).suffix.lower()
     is_spreadsheet = ext in (".xlsx", ".xls", ".xlsm", ".csv", ".tsv")
 
+    # Analyze the template up-front (when present) so its layout catalog
+    # and accent palette are available to inject into the LLM prompt.
+    template_style: TemplateStyle | None = None
+    template_kit: str | None = None
+    if template_path:
+        print(f"🎨 Analyzing template {template_path}...")
+        template_style = analyze_template(template_path)
+        template_kit = render_template_kit(template_style)
+        purposes = {p for li in template_style.layout_catalog for p in li.purposes}
+        print(f"   Layouts: {len(template_style.layout_catalog)} | "
+              f"Purposes: {', '.join(sorted(purposes)) or '(none inferred)'} | "
+              f"Accents: {len(template_style.accent_palette)}")
+
     # 1. Read & parse
     print(f"📄 Reading {input_path}...")
 
@@ -1400,6 +2410,7 @@ def generate_pptx(
                     host=ollama_host,
                     model=ollama_model,
                     system_prompt=system_prompt,
+                    template_kit=template_kit,
                 )
                 print("raw_text:\n", raw_text)
                 print("rewritten:\n", rewritten)
@@ -1427,10 +2438,9 @@ def generate_pptx(
     print(f"   Found {len(deck.slides)} slides ({', '.join(parts)})")
 
     # 2. Build the presentation
-    if template_path:
-        print(f"🎨 Loading template from {template_path}...")
-        style = analyze_template(template_path)
-        prs = Presentation(template_path)
+    if template_style is not None:
+        style = template_style
+        prs = style.presentation
 
         # Remove any existing slides from the template
         for _ in range(len(prs.slides)):
@@ -1468,6 +2478,17 @@ def generate_pptx(
             elif sc.slide_type == "table":
                 _add_table_slide_default(prs, sc)
             else:
+                # Content slide — also handles quote/bignum/stat_grid in the
+                # default (no-template) path. Without a template palette we
+                # can't meaningfully render those as distinct creative slides,
+                # so we fold their extracted content back into bullets so the
+                # default renderer can still show it.
+                if sc.quote_text:
+                    sc.body_lines = [f"\u201c{sc.quote_text}\u201d"] + sc.body_lines
+                if sc.big_number:
+                    sc.body_lines = [f"{sc.big_number[0]} — {sc.big_number[1]}"] + sc.body_lines
+                if sc.stats:
+                    sc.body_lines = [f"{v} — {l}" for v, l in sc.stats] + sc.body_lines
                 _add_content_slide_default(prs, sc)
 
     # 3. Save
