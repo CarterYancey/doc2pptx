@@ -33,7 +33,7 @@ def generate_pptx(document_file, template_file):
             str(workdir),
             "uploaded_document"
         )
-        output_pptx = workdir / f"{document_file}_output.pptx"
+        output_pptx = workdir / f"{input_doc.stem}.pptx"
 
         input_template = None
         if template_file is not None:
