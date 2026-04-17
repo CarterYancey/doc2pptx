@@ -51,7 +51,7 @@ def generate_pptx(
             )
 
         prompt_file_path = None
-        if custom_prompt and custom_prompt.strip():
+        if custom_prompt and custom_prompt.strip() and custom_prompt.strip() != doc2pptx.DEFAULT_REWRITE_PROMPT.strip():
             prompt_path = workdir / "custom_prompt.txt"
             prompt_path.write_text(custom_prompt, encoding="utf-8")
             prompt_file_path = str(prompt_path)
@@ -106,9 +106,9 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 value=doc2pptx.DEFAULT_OLLAMA_MODEL,
             )
         custom_prompt_input = gr.Textbox(
-            label="Custom system prompt (optional — leave blank for default)",
-            lines=4,
-            placeholder="Override the default rewrite instructions...",
+            label="System prompt (edit to override; restore default by matching the text below)",
+            value=doc2pptx.DEFAULT_REWRITE_PROMPT,
+            lines=10,
         )
 
     run_button = gr.Button("Generate PowerPoint", variant="primary")
