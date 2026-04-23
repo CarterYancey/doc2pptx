@@ -21,6 +21,22 @@ def _copy_with_original_name(src_path: str, dst_dir: str, fallback_name: str) ->
     return dst
 
 
+def _read_log_tail(path: Path, max_bytes: int = 200_000) -> str:
+    """Read up to `max_bytes` from the tail of a log file; return '' on error."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            data = fh.read()
+        text = data.decode("utf-8", errors="replace")
+        if size > max_bytes:
+            text = f"… [truncated — showing last {max_bytes} of {size} bytes]\n" + text
+        return text
+    except OSError:
+        return ""
+
+
 def generate_pptx(
     document_file,
     template_file,
@@ -30,11 +46,20 @@ def generate_pptx(
     custom_prompt,
     max_chunk_chars,
     chunk_overlap_sentences,
+    verbose_logging,
 ):
     if document_file is None:
         raise gr.Error("Please upload a document file.")
 
     workdir = Path(tempfile.mkdtemp(prefix="claude_doc2pptx_"))
+    log_path = workdir / "doc2pptx.log"
+
+    # Always write a fresh log file for each run; verbose toggles terminal output only.
+    doc2pptx.configure_logging(
+        log_file=log_path,
+        verbose=bool(verbose_logging),
+        quiet=False,
+    )
 
     try:
         input_doc = _copy_with_original_name(
@@ -74,8 +99,13 @@ def generate_pptx(
         if not output_pptx.exists():
             raise gr.Error("The generator finished, but output.pptx was not created.")
 
-        return str(output_pptx)
+        log_text = _read_log_tail(log_path)
+        return str(output_pptx), str(log_path), log_text
     except Exception as exc:
+        # Surface logs even on failure so the user can diagnose.
+        log_text = _read_log_tail(log_path)
+        if log_text:
+            raise gr.Error(f"{exc}\n\n--- Last log lines ---\n{log_text[-4000:]}") from exc
         raise gr.Error(str(exc)) from exc
 
 
@@ -128,9 +158,26 @@ with gr.Blocks(title=APP_TITLE) as demo:
                 info="Trailing sentences from the previous chunk prepended to the next for continuity.",
             )
 
+    with gr.Accordion("Logging", open=False):
+        verbose_logging_input = gr.Checkbox(
+            label="Verbose terminal output (DEBUG) — includes full extracted text, chunk contents, and LLM prompts/responses in the server log",
+            value=False,
+        )
+        gr.Markdown(
+            "A detailed log (`doc2pptx.log`) is always written to the run workdir and shown below after each run. "
+            "It contains the full extracted text, every chunk, every LLM prompt/input/response, and per-chunk timings."
+        )
+
     run_button = gr.Button("Generate PowerPoint", variant="primary")
 
     output_file = gr.File(label="Generated PowerPoint")
+    log_file_output = gr.File(label="Run log (download the full trace)")
+    log_text_output = gr.Textbox(
+        label="Run log (tail)",
+        lines=24,
+        interactive=False,
+        show_copy_button=True,
+    )
 
     run_button.click(
         fn=generate_pptx,
@@ -143,8 +190,9 @@ with gr.Blocks(title=APP_TITLE) as demo:
             custom_prompt_input,
             max_chunk_chars_input,
             chunk_overlap_sentences_input,
+            verbose_logging_input,
         ],
-        outputs=[output_file],
+        outputs=[output_file, log_file_output, log_text_output],
     )
 
 
