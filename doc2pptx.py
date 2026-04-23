@@ -346,13 +346,13 @@ def read_document(path: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:26b")
 
 DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly into a PowerPoint deck.
 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
-- Use `#` for the deck title, `##` for each slide title, `###` for sub-sections.
+- Use `#` for the deck title, `##` for each new section title, `###` for slide headings.
 - Under each slide title, write 3-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
 - Do not leave any content out, but do summarize ideas instead of repeating verbatim.
@@ -364,12 +364,11 @@ CONTINUATION_REWRITE_PROMPT = """You are rewriting part of a longer document so 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
 - Do NOT emit a `#` deck title — the deck title was already produced. Start directly with a `##` slide title.
-- Use `##` for each slide title and `###` for sub-sections.
-- Under each slide title, write 3-7 bullet points starting with `- `.
+- Use `##` for each new major section title and `###` for slide headers.
+- Under each slide title, write 5-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
-- Do not leave any content out, but do summarize ideas instead of repeating verbatim.
-- Drop filler, repetition, and boilerplate.
-- A short excerpt from the previous section may appear at the top of the input as context. Do not repeat that excerpt in the output; use it only to stay consistent with what came before.
+- Do not leave any important content out, but do not repeat verbatim unless a direct quote is needed for clarity or completeness.
+- Drop filler, repetition, boilerplate, etc.
 """
 
 
@@ -378,7 +377,7 @@ def rewrite_for_pptx(
     host: str = DEFAULT_OLLAMA_HOST,
     model: str = DEFAULT_OLLAMA_MODEL,
     system_prompt: str | None = None,
-    timeout: float = 120.0,
+    timeout: float = 240.0,
 ) -> str:
     """Ask a local Ollama server to reshape raw_text into PPT-friendly markdown.
 
@@ -598,7 +597,7 @@ def rewrite_for_pptx_chunked(
     host: str = DEFAULT_OLLAMA_HOST,
     model: str = DEFAULT_OLLAMA_MODEL,
     system_prompt: str | None = None,
-    timeout: float = 120.0,
+    timeout: float = 240.0,
     max_chunk_chars: int = 6000,
     overlap_sentences: int = 2,
 ) -> str:
@@ -1738,7 +1737,7 @@ def generate_pptx(
     ollama_host: str = DEFAULT_OLLAMA_HOST,
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
     llm_prompt_file: str | None = None,
-    max_chunk_chars: int = 6000,
+    max_chunk_chars: int = 20000,
     chunk_overlap_sentences: int = 2,
 ):
     """
