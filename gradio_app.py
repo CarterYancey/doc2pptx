@@ -28,6 +28,8 @@ def generate_pptx(
     ollama_host,
     ollama_model,
     custom_prompt,
+    max_chunk_chars,
+    chunk_overlap_sentences,
 ):
     if document_file is None:
         raise gr.Error("Please upload a document file.")
@@ -65,6 +67,8 @@ def generate_pptx(
             ollama_host=(ollama_host or doc2pptx.DEFAULT_OLLAMA_HOST).strip(),
             ollama_model=(ollama_model or doc2pptx.DEFAULT_OLLAMA_MODEL).strip(),
             llm_prompt_file=prompt_file_path,
+            max_chunk_chars=int(max_chunk_chars) if max_chunk_chars else 6000,
+            chunk_overlap_sentences=int(chunk_overlap_sentences) if chunk_overlap_sentences is not None else 2,
         )
 
         if not output_pptx.exists():
@@ -110,6 +114,19 @@ with gr.Blocks(title=APP_TITLE) as demo:
             value=doc2pptx.DEFAULT_REWRITE_PROMPT,
             lines=10,
         )
+        with gr.Row():
+            max_chunk_chars_input = gr.Number(
+                label="Max chunk chars",
+                value=6000,
+                precision=0,
+                info="Large documents are always split on headings/paragraphs. Lower this for small local models.",
+            )
+            chunk_overlap_sentences_input = gr.Number(
+                label="Chunk overlap sentences",
+                value=2,
+                precision=0,
+                info="Trailing sentences from the previous chunk prepended to the next for continuity.",
+            )
 
     run_button = gr.Button("Generate PowerPoint", variant="primary")
 
@@ -124,6 +141,8 @@ with gr.Blocks(title=APP_TITLE) as demo:
             ollama_host_input,
             ollama_model_input,
             custom_prompt_input,
+            max_chunk_chars_input,
+            chunk_overlap_sentences_input,
         ],
         outputs=[output_file],
     )
