@@ -352,8 +352,8 @@ DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly 
 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
-- Use `#` for the deck title, `##` for each new section title, `###` for slide headings.
-- Under each slide title, write 3-7 bullet points starting with `- `.
+- Use `#` for the deck title, `##` for each new section title, `###` for slide headings. There should always be at least 2 slides per section, often more; group as many slides together under the same section as reasonably possible.
+- Under each slide title, write 5-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
 - Do not leave any content out, but do summarize ideas instead of repeating verbatim.
 - Drop filler, repetition, and boilerplate.
@@ -364,7 +364,7 @@ CONTINUATION_REWRITE_PROMPT = """You are rewriting part of a longer document so 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
 - Do NOT emit a `#` deck title — the deck title was already produced. Start directly with a `##` slide title.
-- Use `##` for each new major section title and `###` for slide headers.
+- Use `##` for each new major section title and `###` for slide headers. There should always be at least 2 slides per section, often more; group as many slides together under the same section as reasonably possible.
 - Under each slide title, write 5-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
 - Do not leave any important content out, but do not repeat verbatim unless a direct quote is needed for clarity or completeness.
@@ -718,6 +718,7 @@ def _is_bullet(line: str) -> str | None:
 
 
 def _looks_like_heading(line: str, prev_blank: bool, next_blank: bool) -> bool:
+    # TODO: Make this function better
     """
     Heuristic: detect "implicit headings" in plain text.
     A short standalone line surrounded by blank lines that doesn't end with
@@ -730,6 +731,7 @@ def _looks_like_heading(line: str, prev_blank: bool, next_blank: bool) -> bool:
     if len(stripped) > 80:
         return False
     # Must be surrounded by at least one blank line
+    # TODO: Sometimes, extracting text from pdfs causes line spacing to be compressed, so this may not apply
     if not (prev_blank or next_blank):
         return False
     # Should NOT end with sentence-ending punctuation
