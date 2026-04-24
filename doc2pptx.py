@@ -29,6 +29,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.oxml.ns import qn
 
 
 logger = logging.getLogger("doc2pptx")
@@ -1049,6 +1050,100 @@ class TemplateStyle:
     background_fill: any = None
 
 
+def _ph_type_name(ph) -> str:
+    """Short, readable name for a placeholder's type (for logging)."""
+    try:
+        t = ph.placeholder_format.type
+    except Exception:
+        return "?"
+    if t is None:
+        return "?"
+    return getattr(t, "name", str(t))
+
+
+def _fmt_size(s) -> str:
+    """Format a Pt/EMU size as a readable 'Npt' string for logging."""
+    if s is None:
+        return "None"
+    try:
+        return f"{s.pt}pt"
+    except AttributeError:
+        return str(s)
+
+
+def _describe_background(element, part) -> str:
+    """Return a short description of the background of a layout or master.
+
+    Inspects ``<p:cSld>/<p:bg>`` and reports whether the background is a
+    solid fill, gradient, image (with the rId and resolved target part
+    name), a theme bgRef, or inherited from a parent. Purely observational.
+    """
+    cSld = element.find(qn("p:cSld"))
+    if cSld is None:
+        return "no cSld"
+    bg = cSld.find(qn("p:bg"))
+    if bg is None:
+        return "inherits from master/theme"
+    bgPr = bg.find(qn("p:bgPr"))
+    if bgPr is not None:
+        blip = bgPr.find(qn("a:blipFill"))
+        if blip is not None:
+            inner = blip.find(qn("a:blip"))
+            r_embed = inner.get(qn("r:embed")) if inner is not None else None
+            target = None
+            if r_embed is not None and part is not None:
+                try:
+                    target = str(part.related_parts[r_embed].partname)
+                except Exception:
+                    target = "<unresolved>"
+            return f"image (rId={r_embed}, target={target})"
+        if bgPr.find(qn("a:solidFill")) is not None:
+            return "solid fill"
+        if bgPr.find(qn("a:gradFill")) is not None:
+            return "gradient fill"
+        if bgPr.find(qn("a:pattFill")) is not None:
+            return "pattern fill"
+        return "bgPr (unknown fill)"
+    bgRef = bg.find(qn("p:bgRef"))
+    if bgRef is not None:
+        return f"theme bgRef (idx={bgRef.get('idx')})"
+    return "bg element (empty)"
+
+
+def _log_layout_inventory(prs: Presentation) -> None:
+    """Dump every slide layout and its placeholders at DEBUG level."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug("   Layout inventory (%d layout(s)):", len(prs.slide_layouts))
+    for idx, layout in enumerate(prs.slide_layouts):
+        phs = list(layout.placeholders)
+        logger.debug("     [%d] %r  (%d placeholder(s))", idx, layout.name, len(phs))
+        for ph in phs:
+            pf = ph.placeholder_format
+            default_text = ""
+            if ph.has_text_frame:
+                default_text = (ph.text_frame.text or "").strip().replace("\n", " ")
+                if len(default_text) > 60:
+                    default_text = default_text[:57] + "..."
+            logger.debug(
+                "         idx=%s type=%s name=%r default_text=%r",
+                pf.idx, _ph_type_name(ph), ph.name, default_text,
+            )
+
+
+def _log_background_info(prs: Presentation) -> None:
+    """Dump background fill info for every master and layout at DEBUG level."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    logger.debug("   Background inventory:")
+    for m_idx, master in enumerate(prs.slide_masters):
+        desc = _describe_background(master.element, master.part)
+        logger.debug("     master[%d] %r: %s", m_idx, master.name, desc)
+        for l_idx, layout in enumerate(master.slide_layouts):
+            desc = _describe_background(layout.element, layout.part)
+            logger.debug("       layout[%d] %r: %s", l_idx, layout.name, desc)
+
+
 def _find_best_layout(prs: Presentation, target: str) -> tuple[int, bool]:
     """Find the layout index that best matches a target purpose.
 
@@ -1077,11 +1172,20 @@ def _find_best_layout(prs: Presentation, target: str) -> tuple[int, bool]:
     for priority_kw in keywords:
         for idx, layout in enumerate(layouts):
             if layout.name and priority_kw in layout.name.lower():
+                logger.debug(
+                    "   layout match: target=%r -> idx=%d name=%r (keyword=%r)",
+                    target, idx, layout.name, priority_kw,
+                )
                 return idx, True
 
     # Fallback: title=0, section=0, content=1 (or 0 if only one layout)
     fallback = {"title": 0, "section": 0, "content": min(1, len(layouts) - 1)}
-    return fallback.get(target_lower, 0), False
+    fb_idx = fallback.get(target_lower, 0)
+    logger.debug(
+        "   layout fallback: target=%r -> idx=%d (no keyword match; available=%s)",
+        target, fb_idx, [l.name for l in layouts],
+    )
+    return fb_idx, False
 
 
 def _layout_title_size(layout) -> Pt | None:
@@ -1093,7 +1197,11 @@ def _layout_title_size(layout) -> Pt | None:
         for para in ph.text_frame.paragraphs:
             for run in para.runs:
                 if run.font.size:
+                    logger.debug(
+                        "   title size from layout %r: %s", layout.name, _fmt_size(run.font.size),
+                    )
                     return run.font.size
+    logger.debug("   title size from layout %r: <none advertised>", layout.name)
     return None
 
 
@@ -1117,21 +1225,51 @@ def _extract_font_info(prs: Presentation) -> dict:
                         font = run.font
                         if ph.placeholder_format.idx == 0:  # Title
                             if font.name:
+                                if info["title_font"] != font.name:
+                                    logger.debug(
+                                        "   font detect (layout %r, title ph): title_font %r -> %r",
+                                        layout.name, info["title_font"], font.name,
+                                    )
                                 info["title_font"] = font.name
                             if font.size:
+                                if info["title_size"] != font.size:
+                                    logger.debug(
+                                        "   font detect (layout %r, title ph): title_size %s -> %s",
+                                        layout.name, _fmt_size(info["title_size"]), _fmt_size(font.size),
+                                    )
                                 info["title_size"] = font.size
                             try:
                                 if font.color and font.color.type is not None:
+                                    if info["title_color"] != font.color.rgb:
+                                        logger.debug(
+                                            "   font detect (layout %r, title ph): title_color %s -> %s",
+                                            layout.name, info["title_color"], font.color.rgb,
+                                        )
                                     info["title_color"] = font.color.rgb
                             except (AttributeError, TypeError):
                                 pass
                         elif ph.placeholder_format.idx == 1:  # Body
                             if font.name:
+                                if info["body_font"] != font.name:
+                                    logger.debug(
+                                        "   font detect (layout %r, body ph): body_font %r -> %r",
+                                        layout.name, info["body_font"], font.name,
+                                    )
                                 info["body_font"] = font.name
                             if font.size:
+                                if info["body_size"] != font.size:
+                                    logger.debug(
+                                        "   font detect (layout %r, body ph): body_size %s -> %s",
+                                        layout.name, _fmt_size(info["body_size"]), _fmt_size(font.size),
+                                    )
                                 info["body_size"] = font.size
                             try:
                                 if font.color and font.color.type is not None:
+                                    if info["body_color"] != font.color.rgb:
+                                        logger.debug(
+                                            "   font detect (layout %r, body ph): body_color %s -> %s",
+                                            layout.name, info["body_color"], font.color.rgb,
+                                        )
                                     info["body_color"] = font.color.rgb
                             except (AttributeError, TypeError):
                                 pass
@@ -1144,8 +1282,16 @@ def _extract_font_info(prs: Presentation) -> dict:
                     for run in para.runs:
                         font = run.font
                         if font.name and info["title_font"] == "Calibri":
+                            logger.debug(
+                                "   font detect (existing slide shape %r): title_font Calibri -> %r",
+                                shape.name, font.name,
+                            )
                             info["title_font"] = font.name
                         if font.size and info["title_size"] == Pt(36):
+                            logger.debug(
+                                "   font detect (existing slide shape %r): title_size 36pt -> %s",
+                                shape.name, _fmt_size(font.size),
+                            )
                             info["title_size"] = font.size
 
     return info
@@ -1153,7 +1299,15 @@ def _extract_font_info(prs: Presentation) -> dict:
 
 def analyze_template(template_path: str) -> TemplateStyle:
     """Load a .pptx template and extract its style information."""
+    logger.info("🎨 Analyzing template: %s", template_path)
     prs = Presentation(template_path)
+    logger.debug(
+        "   Template has %d slide master(s), %d slide layout(s), %d existing slide(s)",
+        len(prs.slide_masters), len(prs.slide_layouts), len(prs.slides),
+    )
+    _log_layout_inventory(prs)
+    _log_background_info(prs)
+
     font_info = _extract_font_info(prs)
 
     title_idx, _ = _find_best_layout(prs, "title")
@@ -1181,6 +1335,30 @@ def analyze_template(template_path: str) -> TemplateStyle:
         title_color=font_info["title_color"],
         body_color=font_info["body_color"],
     )
+
+    def _name(i: int) -> str:
+        try:
+            return layouts[i].name or "<unnamed>"
+        except Exception:
+            return "<oob>"
+
+    logger.info(
+        "   Template summary: title=idx %d %r, section=idx %d %r (%s), content=idx %d %r",
+        title_idx, _name(title_idx),
+        section_idx, _name(section_idx),
+        "matched" if section_found else "fallback -> default renderer",
+        content_idx, _name(content_idx),
+    )
+    logger.info(
+        "   Template fonts: title=%r %s color=%s, body=%r %s color=%s",
+        style.title_font, _fmt_size(style.title_size), style.title_color,
+        style.body_font, _fmt_size(style.body_size), style.body_color,
+    )
+    if style.section_title_size is not None:
+        logger.debug("   section title size override: %s", _fmt_size(style.section_title_size))
+    if style.content_title_size is not None:
+        logger.debug("   content title size override: %s", _fmt_size(style.content_title_size))
+
     return style
 
 
@@ -1249,7 +1427,12 @@ def _add_title_slide_default(prs: Presentation, slide_content: SlideContent, sub
 def _add_section_slide_default(prs: Presentation, slide_content: SlideContent):
     """Create a section divider slide with default style."""
     # Use a blank layout and build manually
-    slide_layout = prs.slide_layouts[min(6, len(prs.slide_layouts) - 1)]  # Blank
+    layout_idx = min(6, len(prs.slide_layouts) - 1)
+    slide_layout = prs.slide_layouts[layout_idx]
+    logger.info(
+        "   slide: type=section title=%r -> default section renderer (blank layout idx=%d %r, navy bg)",
+        slide_content.title, layout_idx, slide_layout.name,
+    )
     slide = prs.slides.add_slide(slide_layout)
 
     bg = slide.background
@@ -1529,9 +1712,17 @@ def _add_table_slide_from_template(prs: Presentation, style: TemplateStyle, slid
     """Create a table slide using the template's layout and style."""
     layouts = prs.slide_layouts
     layout_idx = min(style.content_layout_idx, len(layouts) - 1)
-    slide = prs.slides.add_slide(layouts[layout_idx])
+    layout = layouts[layout_idx]
+    n_rows = len(slide_content.table_rows)
+    n_cols = len(slide_content.table_headers)
+    logger.info(
+        "   slide: type=table title=%r -> layout idx=%d %r (%d cols x %d rows)",
+        slide_content.title, layout_idx, layout.name, n_cols, n_rows,
+    )
+    slide = prs.slides.add_slide(layout)
 
     # Set the title placeholder if available
+    title_set = False
     for ph in slide.placeholders:
         if ph.placeholder_format.idx == 0:
             ph.text = slide_content.title
@@ -1540,9 +1731,16 @@ def _add_table_slide_from_template(prs: Presentation, style: TemplateStyle, slid
                     run.font.name = style.title_font
                     if style.title_color:
                         run.font.color.rgb = style.title_color
+            title_set = True
+            logger.debug(
+                "     table title placeholder found: idx=0 name=%r (filled)", ph.name,
+            )
             break
+    if not title_set:
+        logger.debug(
+            "     no idx=0 title placeholder on table layout; table title not rendered as placeholder"
+        )
 
-    n_rows = len(slide_content.table_rows)
     available_height = 4.0
     row_height_estimate = min(0.35, available_height / (n_rows + 1))
     table_height = row_height_estimate * (n_rows + 1)
@@ -1580,6 +1778,10 @@ def _set_placeholder_text(ph, text: str, fallback_font: str,
     ``font.name``/``font.size``/``font.color`` when the layout itself
     didn't provide one.
     """
+    logger.debug(
+        "     set placeholder text: idx=%d name=%r text=%r",
+        ph.placeholder_format.idx, ph.name, text[:60],
+    )
     tf = ph.text_frame
     # Keep the first paragraph (inherits layout pPr); drop the rest.
     while len(tf.paragraphs) > 1:
@@ -1595,22 +1797,34 @@ def _set_placeholder_text(ph, text: str, fallback_font: str,
         run = p.add_run()
     run.text = text
     # Only fill in properties the layout didn't already supply.
+    applied = []
     if not run.font.name and fallback_font:
         run.font.name = fallback_font
+        applied.append(f"name={fallback_font!r}")
     if run.font.size is None and fallback_size:
         run.font.size = fallback_size
+        applied.append(f"size={_fmt_size(fallback_size)}")
     try:
         has_color = run.font.color and run.font.color.type is not None
     except (AttributeError, TypeError):
         has_color = False
     if not has_color and fallback_color:
         run.font.color.rgb = fallback_color
+        applied.append(f"color={fallback_color}")
+    if applied:
+        logger.debug(
+            "     font fallback applied (layout did not supply): %s", ", ".join(applied),
+        )
 
 
 def _fill_body_placeholder(ph, lines: list[str], style: TemplateStyle):
     """Write ``lines`` into a body placeholder, reusing the layout's
     existing bullet/paragraph formatting for the first line so the
     template's indent and bullet glyph stay intact."""
+    logger.debug(
+        "     fill body placeholder: idx=%d name=%r %d line(s)",
+        ph.placeholder_format.idx, ph.name, len(lines),
+    )
     tf = ph.text_frame
     # Drop every paragraph past the first so we can rebuild from a clean slate.
     while len(tf.paragraphs) > 1:
@@ -1620,6 +1834,7 @@ def _fill_body_placeholder(ph, lines: list[str], style: TemplateStyle):
     for r in list(first_p.runs):
         r._r.getparent().remove(r._r)
 
+    fallback_counts = {"name": 0, "size": 0, "color": 0}
     for i, line in enumerate(lines):
         if i == 0:
             p = first_p
@@ -1629,14 +1844,23 @@ def _fill_body_placeholder(ph, lines: list[str], style: TemplateStyle):
         run.text = line
         if not run.font.name and style.body_font:
             run.font.name = style.body_font
+            fallback_counts["name"] += 1
         if run.font.size is None and style.body_size:
             run.font.size = style.body_size
+            fallback_counts["size"] += 1
         try:
             has_color = run.font.color and run.font.color.type is not None
         except (AttributeError, TypeError):
             has_color = False
         if not has_color and style.body_color:
             run.font.color.rgb = style.body_color
+            fallback_counts["color"] += 1
+    if any(fallback_counts.values()):
+        logger.debug(
+            "     body font fallback applied on %d/%d lines: name=%d size=%d color=%d",
+            max(fallback_counts.values()), len(lines),
+            fallback_counts["name"], fallback_counts["size"], fallback_counts["color"],
+        )
 
 
 def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_content: SlideContent, subtitle: str = ""):
@@ -1645,6 +1869,10 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
     # indistinguishable from content slides; fall back to the default
     # renderer so they still look like section dividers.
     if slide_content.slide_type == "section" and not style.section_layout_found:
+        logger.debug(
+            "   section slide %r -> default renderer (no Section Header layout in template)",
+            slide_content.title,
+        )
         _add_section_slide_default(prs, slide_content)
         return
 
@@ -1661,9 +1889,16 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
         title_size = style.content_title_size or style.title_size
 
     layout_idx = min(layout_idx, len(layouts) - 1)
-    slide = prs.slides.add_slide(layouts[layout_idx])
+    layout = layouts[layout_idx]
+    logger.info(
+        "   slide: type=%s title=%r -> layout idx=%d %r (title_size=%s)",
+        slide_content.slide_type, slide_content.title, layout_idx, layout.name, _fmt_size(title_size),
+    )
+    slide = prs.slides.add_slide(layout)
 
-    # Fill placeholders
+    # Track what we did with each placeholder so "left-untouched" cases
+    # (i.e. stale empty layout boxes) show up in the log.
+    ph_actions: list[str] = []
     for ph in slide.placeholders:
         idx = ph.placeholder_format.idx
         if idx == 0:  # Title placeholder
@@ -1673,6 +1908,9 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
                 fallback_size=title_size,
                 fallback_color=style.title_color,
             )
+            ph_actions.append(
+                f"idx={idx} type={_ph_type_name(ph)} name={ph.name!r} action=filled-title"
+            )
         elif idx == 1:  # Body/subtitle placeholder
             if slide_content.slide_type == "title" and subtitle:
                 _set_placeholder_text(
@@ -1681,8 +1919,30 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
                     fallback_size=style.body_size,
                     fallback_color=style.body_color,
                 )
+                ph_actions.append(
+                    f"idx={idx} type={_ph_type_name(ph)} name={ph.name!r} action=filled-subtitle"
+                )
             elif slide_content.body_lines:
                 _fill_body_placeholder(ph, slide_content.body_lines, style)
+                ph_actions.append(
+                    f"idx={idx} type={_ph_type_name(ph)} name={ph.name!r} action=filled-body"
+                )
+            else:
+                ph_actions.append(
+                    f"idx={idx} type={_ph_type_name(ph)} name={ph.name!r} action=LEFT-UNTOUCHED (no body/subtitle content)"
+                )
+        else:
+            ph_actions.append(
+                f"idx={idx} type={_ph_type_name(ph)} name={ph.name!r} action=LEFT-UNTOUCHED (no handler for this idx)"
+            )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        if ph_actions:
+            logger.debug("     placeholder actions:")
+            for line in ph_actions:
+                logger.debug("       %s", line)
+        else:
+            logger.debug("     placeholder actions: (layout has no placeholders)")
 
     # Fallbacks for minimal layouts that have no title/body placeholders.
     # Without these, H3 slide titles vanish silently because there's nowhere
@@ -1692,6 +1952,9 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
 
     body_top = Inches(1.8)
     if not title_ph_found and slide_content.title and slide_content.slide_type != "section":
+        logger.debug(
+            "     fallback: layout has no title placeholder; adding custom title textbox"
+        )
         title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.5), Inches(8.6), Inches(1.0))
         ttf = title_box.text_frame
         ttf.word_wrap = True
@@ -1707,6 +1970,10 @@ def _add_slide_from_template(prs: Presentation, style: TemplateStyle, slide_cont
         body_top = Inches(1.6)
 
     if not body_ph_found and slide_content.body_lines and slide_content.slide_type == "content":
+        logger.debug(
+            "     fallback: layout has no body placeholder; adding custom body textbox (%d line(s))",
+            len(slide_content.body_lines),
+        )
         txBox = slide.shapes.add_textbox(Inches(0.7), body_top, Inches(8.6), Inches(3.5))
         tf = txBox.text_frame
         tf.word_wrap = True
