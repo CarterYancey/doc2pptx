@@ -20,7 +20,6 @@ def _copy_with_original_name(src_path: str, dst_dir: str, fallback_name: str) ->
     shutil.copy2(src, dst)
     return dst
 
-
 def generate_pptx(
     document_file,
     template_file,
@@ -28,11 +27,22 @@ def generate_pptx(
     ollama_host,
     ollama_model,
     custom_prompt,
+    max_chunk_chars,
+    chunk_overlap_sentences,
+    verbose_logging,
 ):
     if document_file is None:
         raise gr.Error("Please upload a document file.")
 
     workdir = Path(tempfile.mkdtemp(prefix="claude_doc2pptx_"))
+    log_path = workdir / "doc2pptx.log"
+
+    # Always write a fresh log file for each run; verbose toggles terminal output only.
+    doc2pptx.configure_logging(
+        log_file=log_path,
+        verbose=bool(verbose_logging),
+        quiet=False,
+    )
 
     try:
         input_doc = _copy_with_original_name(
@@ -65,13 +75,16 @@ def generate_pptx(
             ollama_host=(ollama_host or doc2pptx.DEFAULT_OLLAMA_HOST).strip(),
             ollama_model=(ollama_model or doc2pptx.DEFAULT_OLLAMA_MODEL).strip(),
             llm_prompt_file=prompt_file_path,
+            max_chunk_chars=int(max_chunk_chars) if max_chunk_chars else 6000,
+            chunk_overlap_sentences=int(chunk_overlap_sentences) if chunk_overlap_sentences is not None else 2,
         )
 
         if not output_pptx.exists():
             raise gr.Error("The generator finished, but output.pptx was not created.")
 
-        return str(output_pptx)
+        return str(output_pptx), str(log_path)
     except Exception as exc:
+        # Surface logs even on failure so the user can diagnose.
         raise gr.Error(str(exc)) from exc
 
 
@@ -110,10 +123,34 @@ with gr.Blocks(title=APP_TITLE) as demo:
             value=doc2pptx.DEFAULT_REWRITE_PROMPT,
             lines=10,
         )
+        with gr.Row():
+            max_chunk_chars_input = gr.Number(
+                label="Max chunk chars",
+                value=20000,
+                precision=0,
+                info="Large documents are always split on headings/paragraphs. Lower this for small local models.",
+            )
+            chunk_overlap_sentences_input = gr.Number(
+                label="Chunk overlap sentences",
+                value=2,
+                precision=0,
+                info="Trailing sentences from the previous chunk prepended to the next for continuity.",
+            )
+
 
     run_button = gr.Button("Generate PowerPoint", variant="primary")
 
     output_file = gr.File(label="Generated PowerPoint")
+    with gr.Accordion("Logging", open=False):
+        verbose_logging_input = gr.Checkbox(
+            label="Verbose terminal output (DEBUG) — includes full extracted text, chunk contents, and LLM prompts/responses in the server log",
+            value=False,
+        )
+        gr.Markdown(
+            "A detailed log (`doc2pptx.log`) is always written to the run workdir and shown below after each run. "
+            "It contains the full extracted text, every chunk, every LLM prompt/input/response, and per-chunk timings."
+        )
+    log_file_output = gr.File(label="Log File (download the full trace)")
 
     run_button.click(
         fn=generate_pptx,
@@ -124,8 +161,11 @@ with gr.Blocks(title=APP_TITLE) as demo:
             ollama_host_input,
             ollama_model_input,
             custom_prompt_input,
+            max_chunk_chars_input,
+            chunk_overlap_sentences_input,
+            verbose_logging_input,
         ],
-        outputs=[output_file],
+        outputs=[output_file, log_file_output],
     )
 
 

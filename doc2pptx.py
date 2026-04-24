@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +29,65 @@ from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+
+
+logger = logging.getLogger("doc2pptx")
+
+
+def _default_log_path(input_path: str | None) -> Path:
+    """Build a timestamped default log path under ./logs/."""
+    stem = Path(input_path).stem if input_path else "run"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("logs") / f"doc2pptx_{ts}_{stem}.log"
+
+
+def configure_logging(
+    log_file: str | Path | None = None,
+    verbose: bool = False,
+    quiet: bool = False,
+) -> Path | None:
+    """Configure terminal + optional file logging for the `doc2pptx` logger.
+
+    Terminal: concise, INFO by default (WARNING if quiet, DEBUG if verbose).
+    File (when `log_file` is set): detailed, DEBUG always — captures full
+    document extraction previews and full LLM prompt/input/response exchanges.
+
+    Returns the resolved log file path (or None if file logging disabled).
+    """
+    # Clear any handlers attached to our namespace from a previous run (Gradio
+    # keeps the process alive and would otherwise duplicate output).
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    term_level = logging.WARNING if quiet else (logging.DEBUG if verbose else logging.INFO)
+    term = logging.StreamHandler(stream=sys.stderr)
+    term.setLevel(term_level)
+    term.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(term)
+
+    resolved: Path | None = None
+    if log_file is not None:
+        resolved = Path(log_file)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(resolved, mode="w", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(fh)
+        logger.debug("Log file opened at %s", resolved)
+    return resolved
+
+
+def _preview(text: str, n: int = 240) -> str:
+    """Single-line preview of a longer string, for INFO-level logs."""
+    text = (text or "").strip().replace("\n", " ⏎ ")
+    if len(text) <= n:
+        return text
+    return text[:n] + f"… [+{len(text) - n} chars]"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -262,7 +324,21 @@ def read_document(path: str) -> str:
             f"Unsupported file type: '{ext}'. "
             f"Supported: {', '.join(readers.keys())}"
         )
-    return reader(path)
+    try:
+        src_bytes = os.path.getsize(path)
+    except OSError:
+        src_bytes = -1
+    t0 = time.monotonic()
+    text = reader(path)
+    dt = time.monotonic() - t0
+    n_lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
+    logger.info(
+        "   Extracted %d chars (%d lines) from %s file (%d bytes) in %.2fs",
+        len(text), n_lines, ext, src_bytes, dt,
+    )
+    logger.info("   Preview: %s", _preview(text, 240))
+    logger.debug("=== EXTRACTED TEXT (%d chars) ===\n%s\n=== END EXTRACTED TEXT ===", len(text), text)
+    return text
 
 
 # ─────────────────────────────────────────────────────────────
@@ -270,17 +346,29 @@ def read_document(path: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2")
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:26b")
 
 DEFAULT_REWRITE_PROMPT = """You are rewriting a document so it converts cleanly into a PowerPoint deck.
 
 Rules:
 - Output ONLY markdown. No preamble, no commentary, no code fences.
-- Use `#` for the deck title, `##` for each slide title, `###` for sub-sections.
-- Under each slide title, write 3-7 bullet points starting with `- `.
+- Use `#` for the deck title, `##` for each new section title, `###` for slide headings. There should always be at least 2 slides per section, often more; group as many slides together under the same section as reasonably possible.
+- Under each slide title, write 5-7 bullet points starting with `- `.
 - Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
 - Do not leave any content out, but do summarize ideas instead of repeating verbatim.
 - Drop filler, repetition, and boilerplate.
+"""
+
+CONTINUATION_REWRITE_PROMPT = """You are rewriting part of a longer document so it converts cleanly into a PowerPoint deck. This chunk is a CONTINUATION of an earlier rewrite.
+
+Rules:
+- Output ONLY markdown. No preamble, no commentary, no code fences.
+- Do NOT emit a `#` deck title — the deck title was already produced. Start directly with a `##` slide title.
+- Use `##` for each new major section title and `###` for slide headers. There should always be at least 2 slides per section, often more; group as many slides together under the same section as reasonably possible.
+- Under each slide title, write 5-7 bullet points starting with `- `.
+- Preserve the original meaning, facts, numbers, and ordering. Do not invent content.
+- Do not leave any important content out, but do not repeat verbatim unless a direct quote is needed for clarity or completeness.
+- Drop filler, repetition, boilerplate, etc.
 """
 
 
@@ -289,7 +377,7 @@ def rewrite_for_pptx(
     host: str = DEFAULT_OLLAMA_HOST,
     model: str = DEFAULT_OLLAMA_MODEL,
     system_prompt: str | None = None,
-    timeout: float = 120.0,
+    timeout: float = 240.0,
 ) -> str:
     """Ask a local Ollama server to reshape raw_text into PPT-friendly markdown.
 
@@ -306,11 +394,303 @@ def rewrite_for_pptx(
         "options": {"temperature": 0.2},
     }
     url = host.rstrip("/") + "/api/generate"
+    logger.debug("POST %s (model=%s, prompt=%d chars, system=%d chars)",
+                 url, model, len(raw_text), len(payload["system"]))
     with httpx.Client(timeout=timeout) as client:
         resp = client.post(url, json=payload)
         resp.raise_for_status()
         data = resp.json()
     return (data.get("response") or "").strip()
+
+
+_HEADING_LINE_RE = re.compile(r"^#{1,4}\s+\S")
+
+
+def _split_into_blocks(text: str) -> list[str]:
+    """Split text into atomic blocks for greedy chunk packing.
+
+    A block is either:
+      - a heading line (starts with 1-4 `#` followed by whitespace and text), or
+      - a paragraph (run of non-blank lines separated by blank lines).
+
+    Blocks preserve their leading/trailing newlines so re-joining with `\\n\\n`
+    produces readable text.
+    """
+    blocks: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        if current:
+            joined = "\n".join(current).strip()
+            if joined:
+                blocks.append(joined)
+            current.clear()
+
+    for line in text.splitlines():
+        if _HEADING_LINE_RE.match(line):
+            # Headings are their own block.
+            flush()
+            blocks.append(line.strip())
+        elif not line.strip():
+            flush()
+        else:
+            current.append(line)
+    flush()
+    return blocks
+
+
+def _split_oversized_block(block: str, max_chunk_chars: int) -> list[str]:
+    """Split a single block that is larger than max_chunk_chars on sentence
+    boundaries. Falls back to hard character slicing if sentences are still
+    too long.
+    """
+    if len(block) <= max_chunk_chars:
+        return [block]
+    sentences = re.split(r"(?<=[.!?])\s+", block)
+    pieces: list[str] = []
+    buf = ""
+    for s in sentences:
+        if not s:
+            continue
+        if len(s) > max_chunk_chars:
+            # Emit whatever is buffered, then hard-slice the long sentence.
+            if buf:
+                pieces.append(buf)
+                buf = ""
+            for i in range(0, len(s), max_chunk_chars):
+                pieces.append(s[i : i + max_chunk_chars])
+            continue
+        candidate = (buf + " " + s).strip() if buf else s
+        if len(candidate) > max_chunk_chars:
+            pieces.append(buf)
+            buf = s
+        else:
+            buf = candidate
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
+def _tail_sentences(text: str, n: int) -> str:
+    """Return the last `n` sentences of text for use as cross-chunk overlap."""
+    if n <= 0 or not text.strip():
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return ""
+    return " ".join(sentences[-n:]).strip()
+
+
+def chunk_document_for_llm(
+    text: str,
+    max_chunk_chars: int = 6000,
+    overlap_sentences: int = 2,
+) -> list[str]:
+    """Split `text` into structure-aware chunks for LLM rewriting.
+
+    Splitting priority: markdown headings (`#`..`####`) → blank-line paragraphs
+    → sentences (only when a single paragraph exceeds `max_chunk_chars`).
+
+    The last `overlap_sentences` sentences of chunk N are prepended to chunk
+    N+1 as orientation context. The overlap is labelled so the model knows not
+    to reproduce it. Always returns at least one chunk.
+    """
+    if max_chunk_chars <= 0:
+        raise ValueError("max_chunk_chars must be positive")
+    text = text or ""
+    if not text.strip():
+        return [text]
+
+    blocks = _split_into_blocks(text)
+    if not blocks:
+        return [text]
+
+    # Pre-split any block larger than the budget.
+    expanded: list[str] = []
+    for b in blocks:
+        if len(b) > max_chunk_chars:
+            expanded.extend(_split_oversized_block(b, max_chunk_chars))
+        else:
+            expanded.append(b)
+
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+    for block in expanded:
+        extra = len(block) + (2 if current_parts else 0)  # "\n\n" separator
+        if current_parts and current_len + extra > max_chunk_chars:
+            chunks.append("\n\n".join(current_parts))
+            current_parts = [block]
+            current_len = len(block)
+        else:
+            current_parts.append(block)
+            current_len += extra
+    if current_parts:
+        chunks.append("\n\n".join(current_parts))
+
+    if len(chunks) <= 1 or overlap_sentences <= 0:
+        final_chunks = chunks
+    else:
+        # Prepend overlap to every chunk after the first.
+        with_overlap: list[str] = [chunks[0]]
+        for i in range(1, len(chunks)):
+            tail = _tail_sentences(chunks[i - 1], overlap_sentences)
+            if tail:
+                header = f"[Context from previous section — do not repeat in output]\n{tail}"
+                with_overlap.append(f"{header}\n\n{chunks[i]}")
+            else:
+                with_overlap.append(chunks[i])
+        final_chunks = with_overlap
+
+    # Log distribution so the user can decide whether to tune max_chunk_chars.
+    sizes = [len(c) for c in final_chunks]
+    if sizes:
+        logger.info(
+            "   Chunking: %d chunk(s) — size min=%d / avg=%d / max=%d (budget=%d, overlap=%d)",
+            len(sizes), min(sizes), sum(sizes) // len(sizes), max(sizes),
+            max_chunk_chars, overlap_sentences,
+        )
+        for i, c in enumerate(final_chunks, start=1):
+            logger.debug(
+                "--- CHUNK %d/%d (%d chars) ---\n%s\n--- END CHUNK %d ---",
+                i, len(final_chunks), len(c), c, i,
+            )
+    return final_chunks
+
+
+def _strip_deck_title_lines(markdown: str) -> str:
+    """Remove any `# ...` deck-title lines. Used on continuation-chunk output
+    as a safety net — the deck title must appear only once.
+    """
+    kept = [ln for ln in markdown.splitlines() if not re.match(r"^#\s+\S", ln)]
+    return "\n".join(kept)
+
+
+def _derive_continuation_prompt(base_prompt: str) -> str:
+    """Given a (possibly user-customized) base prompt, produce a continuation
+    variant that forbids emitting a new `#` deck title.
+    """
+    if base_prompt.strip() == DEFAULT_REWRITE_PROMPT.strip():
+        return CONTINUATION_REWRITE_PROMPT
+    addendum = (
+        "\n\nIMPORTANT — this input is a CONTINUATION of an earlier rewrite: "
+        "do NOT emit a `#` deck title. Start directly with a `##` slide title. "
+        "A short excerpt from the previous section may appear at the top of the "
+        "input as context — do not repeat it in the output."
+    )
+    return base_prompt.rstrip() + addendum
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    h, rem = divmod(seconds, 3600)
+    return f"{h}h{rem // 60:02d}m"
+
+
+def rewrite_for_pptx_chunked(
+    raw_text: str,
+    host: str = DEFAULT_OLLAMA_HOST,
+    model: str = DEFAULT_OLLAMA_MODEL,
+    system_prompt: str | None = None,
+    timeout: float = 240.0,
+    max_chunk_chars: int = 6000,
+    overlap_sentences: int = 2,
+) -> str:
+    """Chunk `raw_text`, rewrite each chunk via Ollama, and stitch results.
+
+    The first chunk uses `system_prompt` (or `DEFAULT_REWRITE_PROMPT`).
+    Subsequent chunks use a continuation variant that forbids a new `#` deck
+    title. If any single chunk fails, its raw text is substituted so the
+    pipeline degrades gracefully (mirroring the single-pass failure mode).
+    """
+    chunks = chunk_document_for_llm(
+        raw_text,
+        max_chunk_chars=max_chunk_chars,
+        overlap_sentences=overlap_sentences,
+    )
+
+    base_prompt = system_prompt or DEFAULT_REWRITE_PROMPT
+    continuation_prompt = _derive_continuation_prompt(base_prompt)
+    total = len(chunks)
+
+    logger.info("   Rewriting with %s at %s (%d chunk(s))", model, host, total)
+    logger.debug("=== BASE SYSTEM PROMPT ===\n%s\n=== END BASE SYSTEM PROMPT ===", base_prompt)
+    if total > 1:
+        logger.debug(
+            "=== CONTINUATION SYSTEM PROMPT ===\n%s\n=== END CONTINUATION SYSTEM PROMPT ===",
+            continuation_prompt,
+        )
+
+    rewritten_parts: list[str] = []
+    durations: list[float] = []
+    wall_start = time.monotonic()
+    for i, chunk in enumerate(chunks, start=1):
+        role = "base" if i == 1 else "continuation"
+        prompt = base_prompt if i == 1 else continuation_prompt
+        logger.info("   [chunk %d/%d] sending %d chars (%s)…", i, total, len(chunk), role)
+        logger.debug(
+            "=== LLM REQUEST chunk %d/%d (%s) ===\n--- USER INPUT (%d chars) ---\n%s\n=== END REQUEST chunk %d ===",
+            i, total, role, len(chunk), chunk, i,
+        )
+
+        t0 = time.monotonic()
+        failed = False
+        try:
+            out = rewrite_for_pptx(
+                chunk,
+                host=host,
+                model=model,
+                system_prompt=prompt,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            failed = True
+            logger.warning(
+                "   [chunk %d/%d] rewrite failed (%s); using raw chunk text.",
+                i, total, exc,
+            )
+            logger.debug("=== LLM ERROR chunk %d/%d ===\n%r", i, total, exc)
+            out = chunk
+        dt = time.monotonic() - t0
+        durations.append(dt)
+
+        if not failed and not out.strip():
+            logger.warning(
+                "   [chunk %d/%d] model returned empty output; using raw chunk text.",
+                i, total,
+            )
+            out = chunk
+
+        if i > 1:
+            before = out
+            out = _strip_deck_title_lines(out)
+            if out != before:
+                logger.debug("   [chunk %d/%d] stripped stray `#` deck-title line(s) from output.", i, total)
+
+        # Progress + ETA based on rolling average.
+        avg = sum(durations) / len(durations)
+        remaining = (total - i) * avg
+        elapsed = time.monotonic() - wall_start
+        logger.info(
+            "   [chunk %d/%d] ← %d chars in %.1fs  (avg %.1fs/chunk, elapsed %s, ETA %s)",
+            i, total, len(out), dt, avg,
+            _format_eta(elapsed), _format_eta(remaining) if total > i else "done",
+        )
+        logger.debug(
+            "=== LLM RESPONSE chunk %d/%d (%.2fs, %d chars) ===\n%s\n=== END RESPONSE chunk %d ===",
+            i, total, dt, len(out), out, i,
+        )
+
+        rewritten_parts.append(out.strip())
+
+    total_elapsed = time.monotonic() - wall_start
+    logger.info("   Rewrite complete: %d chunk(s) in %s", total, _format_eta(total_elapsed))
+    return "\n\n".join(p for p in rewritten_parts if p)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -338,6 +718,7 @@ def _is_bullet(line: str) -> str | None:
 
 
 def _looks_like_heading(line: str, prev_blank: bool, next_blank: bool) -> bool:
+    # TODO: Make this function better
     """
     Heuristic: detect "implicit headings" in plain text.
     A short standalone line surrounded by blank lines that doesn't end with
@@ -350,6 +731,7 @@ def _looks_like_heading(line: str, prev_blank: bool, next_blank: bool) -> bool:
     if len(stripped) > 80:
         return False
     # Must be surrounded by at least one blank line
+    # TODO: Sometimes, extracting text from pdfs causes line spacing to be compressed, so this may not apply
     if not (prev_blank or next_blank):
         return False
     # Should NOT end with sentence-ending punctuation
@@ -1357,6 +1739,8 @@ def generate_pptx(
     ollama_host: str = DEFAULT_OLLAMA_HOST,
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
     llm_prompt_file: str | None = None,
+    max_chunk_chars: int = 20000,
+    chunk_overlap_sentences: int = 2,
 ):
     """
     Main entry point: read a document file and produce a .pptx presentation.
@@ -1375,12 +1759,17 @@ def generate_pptx(
         ollama_model:  Model name to request from Ollama.
         llm_prompt_file: Optional path to a text file containing a custom system
                        prompt to override the default rewrite instructions.
+        max_chunk_chars: Maximum characters per LLM chunk. Large inputs are
+                       always split on headings/paragraphs so small local models
+                       don't overflow their context window.
+        chunk_overlap_sentences: Number of trailing sentences from the previous
+                       chunk to prepend to the next as orientation context.
     """
     ext = Path(input_path).suffix.lower()
     is_spreadsheet = ext in (".xlsx", ".xls", ".xlsm", ".csv", ".tsv")
 
     # 1. Read & parse
-    print(f"📄 Reading {input_path}...")
+    logger.info("📄 Reading %s…", input_path)
 
     if is_spreadsheet:
         deck = read_xlsx(input_path, deck_title=title or "", max_rows_per_slide=max_table_rows)
@@ -1390,28 +1779,32 @@ def generate_pptx(
             raise ValueError(f"No text content could be extracted from '{input_path}'.")
 
         if use_llm:
-            print(f"🧠 Rewriting with Ollama ({ollama_model}) at {ollama_host}...")
+            logger.info("🧠 Rewriting with Ollama (%s) at %s…", ollama_model, ollama_host)
             try:
                 system_prompt = None
                 if llm_prompt_file:
                     system_prompt = Path(llm_prompt_file).read_text(encoding="utf-8")
-                rewritten = rewrite_for_pptx(
+                    logger.info("   Using custom system prompt from %s (%d chars)",
+                                llm_prompt_file, len(system_prompt))
+                rewritten = rewrite_for_pptx_chunked(
                     raw_text,
                     host=ollama_host,
                     model=ollama_model,
                     system_prompt=system_prompt,
+                    max_chunk_chars=max_chunk_chars,
+                    overlap_sentences=chunk_overlap_sentences,
                 )
-                print("raw_text:\n", raw_text)
-                print("rewritten:\n", rewritten)
                 if rewritten:
                     raw_text = rewritten
-                    print("   LLM rewrite applied.")
+                    logger.info("   LLM rewrite applied (%d chars).", len(rewritten))
+                    logger.debug("=== FINAL STITCHED MARKDOWN (%d chars) ===\n%s\n=== END STITCHED MARKDOWN ===",
+                                 len(rewritten), rewritten)
                 else:
-                    print("   ⚠️  LLM returned empty output; using original text.")
+                    logger.warning("   ⚠️  LLM returned empty output; using original text.")
             except Exception as exc:
-                print(f"   ⚠️  LLM rewrite skipped ({exc}); using original text.")
+                logger.warning("   ⚠️  LLM rewrite skipped (%s); using original text.", exc)
 
-        print("🔍 Parsing document structure...")
+        logger.info("🔍 Parsing document structure…")
         deck = parse_text_to_deck(raw_text, deck_title=title or "", max_bullets=max_bullets)
 
     if not deck.slides:
@@ -1424,11 +1817,14 @@ def generate_pptx(
         parts.append(f"{other_count} content")
     if table_count:
         parts.append(f"{table_count} table")
-    print(f"   Found {len(deck.slides)} slides ({', '.join(parts)})")
+    logger.info("   Found %d slides (%s)", len(deck.slides), ", ".join(parts))
+    for idx, sc in enumerate(deck.slides, start=1):
+        logger.debug("   slide %d: type=%s level=%d title=%r bullets=%d",
+                     idx, sc.slide_type, sc.level, sc.title, len(sc.body_lines))
 
     # 2. Build the presentation
     if template_path:
-        print(f"🎨 Loading template from {template_path}...")
+        logger.info("🎨 Loading template from %s…", template_path)
         style = analyze_template(template_path)
         prs = Presentation(template_path)
 
@@ -1448,14 +1844,14 @@ def generate_pptx(
                     pass
             prs.slides._sldIdLst.remove(sldId)
 
-        print("   Generating slides with template styling...")
+        logger.info("   Generating slides with template styling…")
         for sc in deck.slides:
             if sc.slide_type == "table":
                 _add_table_slide_from_template(prs, style, sc)
             else:
                 _add_slide_from_template(prs, style, sc, subtitle=deck.subtitle)
     else:
-        print("🎨 Using default styling...")
+        logger.info("🎨 Using default styling…")
         prs = Presentation()
         prs.slide_width = Inches(10)
         prs.slide_height = Inches(5.625)
@@ -1472,8 +1868,7 @@ def generate_pptx(
 
     # 3. Save
     prs.save(output_path)
-    print(f"✅ Saved to {output_path}")
-    print(f"   {len(deck.slides)} slides generated")
+    logger.info("✅ Saved to %s (%d slides)", output_path, len(deck.slides))
     return output_path
 
 
@@ -1512,19 +1907,47 @@ Examples:
                         help=f"Ollama model name (default: {DEFAULT_OLLAMA_MODEL}, env: OLLAMA_MODEL)")
     parser.add_argument("--prompt-file", default=None,
                         help="Path to a text file containing a custom system prompt for the rewrite step.")
+    parser.add_argument("--max-chunk-chars", type=int, default=6000,
+                        help="Max characters per LLM chunk; large docs are split on headings/paragraphs (default: 6000).")
+    parser.add_argument("--chunk-overlap-sentences", type=int, default=2,
+                        help="Trailing sentences from the previous chunk to prepend to the next as context (default: 2).")
+    parser.add_argument("--log-file", default=None,
+                        help="Path for the verbose run log. If omitted, a timestamped log is written under ./logs/. "
+                             "Full LLM prompts, inputs, and responses are captured at DEBUG level.")
+    parser.add_argument("--no-log-file", action="store_true",
+                        help="Disable writing a run log file (terminal logging still runs).")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show DEBUG-level output in the terminal (chunk previews, prompts, responses).")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Only show WARNING-level output in the terminal (the log file still captures everything).")
 
     args = parser.parse_args()
 
+    if args.verbose and args.quiet:
+        print("Error: --verbose and --quiet are mutually exclusive.", file=sys.stderr)
+        sys.exit(2)
+
+    log_file_path: Path | None = None
+    if not args.no_log_file:
+        log_file_path = Path(args.log_file) if args.log_file else _default_log_path(args.input)
+    resolved_log = configure_logging(
+        log_file=log_file_path,
+        verbose=args.verbose,
+        quiet=args.quiet,
+    )
+    if resolved_log is not None:
+        logger.info("📝 Writing run log to %s", resolved_log)
+
     if not os.path.exists(args.input):
-        print(f"Error: Input file not found: {args.input}", file=sys.stderr)
+        logger.error("Input file not found: %s", args.input)
         sys.exit(1)
 
     if args.template and not os.path.exists(args.template):
-        print(f"Error: Template file not found: {args.template}", file=sys.stderr)
+        logger.error("Template file not found: %s", args.template)
         sys.exit(1)
 
     if args.prompt_file and not os.path.exists(args.prompt_file):
-        print(f"Error: Prompt file not found: {args.prompt_file}", file=sys.stderr)
+        logger.error("Prompt file not found: %s", args.prompt_file)
         sys.exit(1)
 
     generate_pptx(
@@ -1538,6 +1961,8 @@ Examples:
         ollama_host=args.ollama_host,
         ollama_model=args.ollama_model,
         llm_prompt_file=args.prompt_file,
+        max_chunk_chars=args.max_chunk_chars,
+        chunk_overlap_sentences=args.chunk_overlap_sentences,
     )
 
 
