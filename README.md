@@ -23,31 +23,31 @@ uv sync
 Basic conversion:
 
 ```bash
-uv run doc2pptx.py input.md -o output.pptx
+uv run python -m doc2pptx input.md -o output.pptx
 ```
 
 With a style template:
 
 ```bash
-uv run doc2pptx.py report.pdf -o output.pptx --template brand.pptx
+uv run python -m doc2pptx report.pdf -o output.pptx --template brand.pptx
 ```
 
 With custom title:
 
 ```bash
-uv run doc2pptx.py notes.txt -o output.pptx --template brand.pptx --title "My Deck"
+uv run python -m doc2pptx notes.txt -o output.pptx --template brand.pptx --title "My Deck"
 ```
 
 Limit bullets per slide:
 
 ```bash
-uv run doc2pptx.py article.docx -o slides.pptx --max-bullets 5
+uv run python -m doc2pptx article.docx -o slides.pptx --max-bullets 5
 ```
 
 Spreadsheet with custom rows per table slide:
 
 ```bash
-uv run doc2pptx.py data.csv -o tables.pptx --max-table-rows 10
+uv run python -m doc2pptx data.csv -o tables.pptx --max-table-rows 10
 ```
 
 ## Supported Formats
@@ -91,13 +91,13 @@ Pull a model once, then run as usual:
 
 ```bash
 ollama pull llama3.2
-uv run doc2pptx.py report.pdf -o deck.pptx
+uv run python -m doc2pptx report.pdf -o deck.pptx
 ```
 
 Override the model, host, or prompt:
 
 ```bash
-uv run doc2pptx.py report.pdf -o deck.pptx \
+uv run python -m doc2pptx report.pdf -o deck.pptx \
     --ollama-model qwen2.5 \
     --ollama-host http://localhost:11434 \
     --prompt-file my_prompt.txt
